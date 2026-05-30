@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
@@ -40,6 +41,12 @@ type Client struct {
 
 // ErrReadOnly is returned when a write operation is attempted in read-only mode.
 var ErrReadOnly = fmt.Errorf("operation blocked: provider is in read_only mode — only data sources and imports are allowed")
+
+// ErrNotFound is returned when a requested resource does not exist on the
+// controller. Callers (resource Read methods) should check errors.Is(err,
+// ErrNotFound) and call resp.State.RemoveResource(ctx) to model drift
+// gracefully instead of surfacing a hard error.
+var ErrNotFound = fmt.Errorf("not found")
 
 // APIResponse is the standard response envelope from the Omada API.
 type APIResponse struct {
@@ -2692,32 +2699,67 @@ func (c *Client) UpdateSwitchServiceConfig(ctx context.Context, siteID, mac stri
 // --- Firewall ACL Rules ---
 
 // ACLDirection specifies which traffic directions an ACL applies to.
+// WanInIDs and VpnInIDs must serialize as [] (never omitted) to satisfy the
+// controller's schema validation.
 type ACLDirection struct {
+	WanInIDs []string `json:"wanInIds"`
+	VpnInIDs []string `json:"vpnInIds"`
 	LanToWan bool     `json:"lanToWan"`
 	LanToLan bool     `json:"lanToLan"`
-	WanInIDs []string `json:"wanInIds,omitempty"`
-	VpnInIDs []string `json:"vpnInIds,omitempty"`
 }
 
 // ACLRule represents a firewall ACL rule.
+// CustomAclOsws, CustomAclStacks, and CustomAclDevices must serialize as []
+// (never omitted) to satisfy the controller's schema validation.
 type ACLRule struct {
-	ID              string       `json:"id,omitempty"`
-	Name            string       `json:"name"`
-	Type            int          `json:"type"`            // 0=gateway, 1=switch, 2=eap
-	Index           int          `json:"index,omitempty"` // rule ordering (first-match-wins)
-	Status          bool         `json:"status"`          // enabled/disabled
-	Policy          int          `json:"policy"`          // 0=deny, 1=permit
-	Protocols       []int        `json:"protocols"`       // 6=TCP, 17=UDP, 1=ICMP, etc.
-	SourceType      int          `json:"sourceType"`      // 0=network, 2=ip_group
-	SourceIDs       []string     `json:"sourceIds"`
-	DestinationType int          `json:"destinationType"` // 0=network, 2=ip_group
-	DestinationIDs  []string     `json:"destinationIds"`
-	Direction       ACLDirection `json:"direction"`
-	StateMode       int          `json:"stateMode,omitempty"` // 0=auto (stateful)
-	BiDirectional   bool         `json:"biDirectional,omitempty"`
-	IPSec           int          `json:"ipSec,omitempty"`
-	Syslog          bool         `json:"syslog,omitempty"`
-	Resource        int          `json:"resource,omitempty"`
+	ID               string       `json:"id,omitempty"`
+	Name             string       `json:"name"`
+	Type             int          `json:"type"`            // 0=gateway, 1=switch, 2=eap
+	Index            int          `json:"index,omitempty"` // rule ordering (first-match-wins)
+	Status           bool         `json:"status"`          // enabled/disabled
+	Policy           int          `json:"policy"`          // 0=deny, 1=permit
+	Protocols        []int        `json:"protocols"`       // 6=TCP, 17=UDP, 1=ICMP, 256=any
+	SourceType       int          `json:"sourceType"`      // 0=network, 1=ip_group
+	SourceIDs        []string     `json:"sourceIds"`
+	DestinationType  int          `json:"destinationType"` // 0=network, 1=ip_group
+	DestinationIDs   []string     `json:"destinationIds"`
+	Direction        ACLDirection `json:"direction"`
+	StateMode        int          `json:"stateMode,omitempty"` // 0=auto (stateful)
+	BiDirectional    bool         `json:"biDirectional,omitempty"`
+	IPSec            int          `json:"ipSec,omitempty"`
+	Syslog           bool         `json:"syslog,omitempty"`
+	Resource         int          `json:"resource,omitempty"`
+	CustomAclOsws    []string     `json:"customAclOsws"`
+	CustomAclStacks  []string     `json:"customAclStacks"`
+	CustomAclDevices []string     `json:"customAclDevices"`
+}
+
+// normalizeACLRule ensures nil slices that must serialize as [] are initialized
+// to empty (non-nil) slices before marshaling.
+// SourceIDs / DestinationIDs must be [] (not null) even for "any" rules;
+// the controller rejects null with -33609 "Choose the source and destination".
+func normalizeACLRule(rule *ACLRule) {
+	if rule.SourceIDs == nil {
+		rule.SourceIDs = []string{}
+	}
+	if rule.DestinationIDs == nil {
+		rule.DestinationIDs = []string{}
+	}
+	if rule.CustomAclOsws == nil {
+		rule.CustomAclOsws = []string{}
+	}
+	if rule.CustomAclStacks == nil {
+		rule.CustomAclStacks = []string{}
+	}
+	if rule.CustomAclDevices == nil {
+		rule.CustomAclDevices = []string{}
+	}
+	if rule.Direction.WanInIDs == nil {
+		rule.Direction.WanInIDs = []string{}
+	}
+	if rule.Direction.VpnInIDs == nil {
+		rule.Direction.VpnInIDs = []string{}
+	}
 }
 
 // ACLListResult wraps the paginated ACL list response with metadata.
@@ -2770,12 +2812,44 @@ func (c *Client) GetACLRule(ctx context.Context, siteID, ruleID string, aclType 
 }
 
 // CreateACLRule creates a new ACL rule.
+// The Omada controller response varies by version:
+//   - v6.x live: bare string ID (or empty string) — not a full ACLRule object.
+//   - Some versions: full ACLRule object.
+//
+// Strategy (mirrors CreateIPGroup):
+//  1. Empty result → list all rules and match by name.
+//  2. String ID    → GetACLRule (list+match by id) to return the full rule.
+//  3. Full object  → return it directly (legacy/future-proof path).
 func (c *Client) CreateACLRule(ctx context.Context, siteID string, rule *ACLRule) (*ACLRule, error) {
+	normalizeACLRule(rule)
 	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/firewall/acls", rule)
 	if err != nil {
 		return nil, err
 	}
 
+	// Empty result path: controller returned no id.
+	// List all rules of this type and match by name.
+	if isEmptyResult(resp.Result) {
+		rules, err := c.ListACLRules(ctx, siteID, rule.Type)
+		if err != nil {
+			return nil, fmt.Errorf("listing ACL rules after create (no id in response): %w", err)
+		}
+		for i := range rules {
+			if rules[i].Name == rule.Name {
+				return &rules[i], nil
+			}
+		}
+		return nil, fmt.Errorf("ACL rule %q not found after create", rule.Name)
+	}
+
+	// Try to unmarshal result as a string ID (the live v6 API response shape).
+	var ruleID string
+	if err := json.Unmarshal(resp.Result, &ruleID); err == nil && ruleID != "" {
+		// String-id path: fetch the full rule by id (list + match).
+		return c.GetACLRule(ctx, siteID, ruleID, rule.Type)
+	}
+
+	// Full-object path: controller returned a complete ACLRule (legacy/future).
 	var created ACLRule
 	if err := json.Unmarshal(resp.Result, &created); err != nil {
 		return nil, fmt.Errorf("decoding created ACL rule: %w", err)
@@ -2783,9 +2857,12 @@ func (c *Client) CreateACLRule(ctx context.Context, siteID string, rule *ACLRule
 	return &created, nil
 }
 
-// UpdateACLRule updates an existing ACL rule.
+// UpdateACLRule updates an existing ACL rule via PUT.
+// The v6/ER707 controller returns -1600 ("Unsupported request path") for PATCH
+// on ACL endpoints; PUT is the correct verb per the UI-observed API contract.
 func (c *Client) UpdateACLRule(ctx context.Context, siteID, ruleID string, rule *ACLRule) (*ACLRule, error) {
-	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/setting/firewall/acls/%s", ruleID), rule)
+	normalizeACLRule(rule)
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPut, fmt.Sprintf("/setting/firewall/acls/%s", ruleID), rule)
 	if err != nil {
 		return nil, err
 	}
@@ -2805,26 +2882,109 @@ func (c *Client) DeleteACLRule(ctx context.Context, siteID, ruleID string) error
 	return err
 }
 
+// ModifyACLIndex reorders ACL rules by submitting a map of rule-ID → position
+// index. aclType: 0=gateway, 1=switch, 2=eap.
+// Endpoint: POST /api/v2/sites/{site}/cmd/acls/modifyIndex
+func (c *Client) ModifyACLIndex(ctx context.Context, siteID string, aclType int, indexes map[string]int) error {
+	body := struct {
+		Indexes map[string]int `json:"indexes"`
+		Type    int            `json:"type"`
+	}{
+		Indexes: indexes,
+		Type:    aclType,
+	}
+	_, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/cmd/acls/modifyIndex", body)
+	return err
+}
+
 // --- IP Groups ---
 
-// IPGroupEntry represents a single IP + port combination within an IP group.
+// SplitCIDR parses a CIDR-or-bare-IP string into a bare IP address and integer
+// prefix length. A bare host address (no "/" suffix) yields mask 32.
+// Returns an error if the string is not a valid IP or CIDR.
+//
+// Examples:
+//
+//	"10.10.50.0/24"  → ("10.10.50.0", 24, nil)
+//	"10.10.70.98"    → ("10.10.70.98", 32, nil)
+//	"not-an-ip"      → ("", 0, error)
+func SplitCIDR(cidrOrIP string) (string, int, error) {
+	// Try parsing as CIDR first (e.g. "10.10.50.0/24").
+	ip, ipNet, err := net.ParseCIDR(cidrOrIP)
+	if err == nil {
+		ones, _ := ipNet.Mask.Size()
+		// ParseCIDR masks the host bits; use the original parsed IP (host addr).
+		return ip.String(), ones, nil
+	}
+	// Fall back to bare IP (no prefix → mask 32).
+	parsed := net.ParseIP(cidrOrIP)
+	if parsed == nil {
+		return "", 0, fmt.Errorf("invalid IP or CIDR: %q", cidrOrIP)
+	}
+	return parsed.String(), 32, nil
+}
+
+// IPGroupEntry represents a single IP entry within an IP group using the v6
+// wire shape: bare IP address + integer mask (not a CIDR string) + description.
 type IPGroupEntry struct {
-	IP       string   `json:"ip"`
-	PortList []string `json:"portList,omitempty"` // port numbers/ranges as strings (e.g., "80", "7000-7100")
+	IP          string   `json:"ip"`
+	Mask        int      `json:"mask"`
+	Description string   `json:"description"`
+	PortList    []string `json:"portList,omitempty"` // port numbers/ranges (e.g. "80", "7000-7100")
+}
+
+// ipGroupWire is the v6 wire body for create/update. It includes all envelope
+// fields that the ER707 controller requires even when null.
+type ipGroupWire struct {
+	Name           string         `json:"name"`
+	Type           int            `json:"type"`
+	IPList         []IPGroupEntry `json:"ipList"`
+	IPv6List       interface{}    `json:"ipv6List"`
+	MACAddressList interface{}    `json:"macAddressList"`
+	PortList       interface{}    `json:"portList"`
+	CountryList    interface{}    `json:"countryList"`
+	Description    string         `json:"description"`
+	PortType       interface{}    `json:"portType"`
+	PortMaskList   interface{}    `json:"portMaskList"`
+	DomainNamePort interface{}    `json:"domainNamePort"`
+	OUIList        interface{}    `json:"ouiList"`
+	Count          int            `json:"count"`
 }
 
 // IPGroup represents an IP/Port group used in ACL rules.
+// The v6/ER707 controller uses "groupId" (not "id") as the field name in GET
+// responses for /setting/profiles/groups.
 type IPGroup struct {
-	ID     string         `json:"id,omitempty"`
+	ID     string         `json:"groupId,omitempty"`
 	Name   string         `json:"name"`
-	Type   int            `json:"type"` // 1=IP/Port group
+	Type   int            `json:"type"` // 0=IP-only, 1=IP/Port group
 	IPList []IPGroupEntry `json:"ipList"`
+}
+
+// toWire converts an IPGroup to the v6 wire shape with null envelope fields.
+func (g *IPGroup) toWire() *ipGroupWire {
+	return &ipGroupWire{
+		Name:           g.Name,
+		Type:           g.Type,
+		IPList:         g.IPList,
+		IPv6List:       nil,
+		MACAddressList: nil,
+		PortList:       nil,
+		CountryList:    nil,
+		Description:    "",
+		PortType:       nil,
+		PortMaskList:   nil,
+		DomainNamePort: nil,
+		OUIList:        nil,
+		Count:          0,
+	}
 }
 
 // ListIPGroups returns all IP groups for a site.
 // Note: requires a gateway device adopted into the site.
+// Endpoint: GET /setting/profiles/groups (v6/ER707 path).
 func (c *Client) ListIPGroups(ctx context.Context, siteID string) ([]IPGroup, error) {
-	resp, err := c.doSiteRequestWithParams(ctx, siteID, http.MethodGet, "/setting/firewall/ipGroups", "&currentPage=1&currentPageSize=100", nil)
+	resp, err := c.doSiteRequestWithParams(ctx, siteID, http.MethodGet, "/setting/profiles/groups", "&currentPage=1&currentPageSize=100", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2835,7 +2995,9 @@ func (c *Client) ListIPGroups(ctx context.Context, siteID string) ([]IPGroup, er
 	return groups, nil
 }
 
-// GetIPGroup returns a single IP group by ID.
+// GetIPGroup returns a single IP group by ID. Returns an error wrapping
+// ErrNotFound when the group is absent from the controller, allowing callers
+// to detect drift via errors.Is(err, ErrNotFound).
 func (c *Client) GetIPGroup(ctx context.Context, siteID, groupID string) (*IPGroup, error) {
 	groups, err := c.ListIPGroups(ctx, siteID)
 	if err != nil {
@@ -2846,26 +3008,38 @@ func (c *Client) GetIPGroup(ctx context.Context, siteID, groupID string) (*IPGro
 			return &g, nil
 		}
 	}
-	return nil, fmt.Errorf("IP group %q not found", groupID)
+	return nil, fmt.Errorf("IP group %q: %w", groupID, ErrNotFound)
 }
 
 // CreateIPGroup creates a new IP group.
+// Endpoint: POST /setting/profiles/groups (v6/ER707 path).
+// The request body uses the v6 wire shape with explicit null envelope fields.
+// The v6/ER707 controller returns the new group ID as a bare string (not an
+// object), so we unmarshal as string first and re-fetch via GetIPGroup —
+// mirroring the CreateMDNSRule/CreateNetwork pattern.
 func (c *Client) CreateIPGroup(ctx context.Context, siteID string, group *IPGroup) (*IPGroup, error) {
-	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/firewall/ipGroups", group)
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/profiles/groups", group.toWire())
 	if err != nil {
 		return nil, err
 	}
 
-	var created IPGroup
-	if err := json.Unmarshal(resp.Result, &created); err != nil {
-		return nil, fmt.Errorf("decoding created IP group: %w", err)
+	// The API returns the new group ID as a quoted string, not a full object.
+	var groupID string
+	if err := json.Unmarshal(resp.Result, &groupID); err != nil {
+		return nil, fmt.Errorf("decoding created IP group ID: %w", err)
 	}
-	return &created, nil
+
+	// Fetch the full group by listing + filtering.
+	return c.GetIPGroup(ctx, siteID, groupID)
 }
 
-// UpdateIPGroup updates an existing IP group.
+// UpdateIPGroup updates an existing IP group via PUT.
+// Endpoint: PUT /setting/profiles/groups/{id} (v6/ER707 path).
+// The v6/ER707 controller returns -1600 ("Unsupported request path") for PATCH
+// on profiles/groups endpoints; PUT is the correct verb per the UI-observed API
+// contract (same fix applied to UpdateACLRule on this branch).
 func (c *Client) UpdateIPGroup(ctx context.Context, siteID, groupID string, group *IPGroup) (*IPGroup, error) {
-	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/setting/firewall/ipGroups/%s", groupID), group)
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPut, fmt.Sprintf("/setting/profiles/groups/%s", groupID), group.toWire())
 	if err != nil {
 		return nil, err
 	}
@@ -2880,8 +3054,9 @@ func (c *Client) UpdateIPGroup(ctx context.Context, siteID, groupID string, grou
 }
 
 // DeleteIPGroup deletes an IP group.
+// Endpoint: DELETE /setting/profiles/groups/{id} (v6/ER707 path).
 func (c *Client) DeleteIPGroup(ctx context.Context, siteID, groupID string) error {
-	_, err := c.doSiteRequest(ctx, siteID, http.MethodDelete, fmt.Sprintf("/setting/firewall/ipGroups/%s", groupID), nil)
+	_, err := c.doSiteRequest(ctx, siteID, http.MethodDelete, fmt.Sprintf("/setting/profiles/groups/%s", groupID), nil)
 	return err
 }
 
