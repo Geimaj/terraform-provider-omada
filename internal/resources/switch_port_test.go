@@ -2,11 +2,25 @@ package resources
 
 import (
 	"context"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
+
+func TestSwitchPort_MirroredPortRefsToSet_OrderIndependent(t *testing.T) {
+	ctx := context.Background()
+	set := mirroredPortRefsToSet(ctx, []client.MirroredPortRef{{Port: 16}, {Port: 1}, {Port: 3}, {Port: 5}, {Port: 14}})
+	var got []int64
+	set.ElementsAs(ctx, &got, false)
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	want := []int64{1, 3, 5, 14, 16}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
 
 // TestSwitchPort_SpeedToLinkDuplex_Table verifies the speed→{linkSpeed,duplex}
 // mapping table covers all confirmed speed codes and gaps.
@@ -451,6 +465,76 @@ func TestSwitchPort_ApplyToModel(t *testing.T) {
 	model.TagNetworkIDs.ElementsAs(ctx, &tags, false)
 	if len(tags) != 2 || tags[0] != "net-1" {
 		t.Errorf("TagNetworkIDs = %v", tags)
+	}
+}
+
+// TestSwitchPort_BuildV2Body_Mirroring verifies that when operation=="mirroring"
+// the builder populates both Operation and MirroredPorts on the PATCH body.
+func TestSwitchPort_BuildV2Body_Mirroring(t *testing.T) {
+	ctx := context.Background()
+	ports, _ := types.SetValueFrom(ctx, types.Int64Type, []int64{1, 3, 5})
+	m := &SwitchPortResourceModel{
+		Port:          types.Int64Value(12),
+		Operation:     types.StringValue("mirroring"),
+		MirroredPorts: ports,
+	}
+	var errs []error
+	got := buildSwitchPortV2Body(ctx, m, &errs)
+	if got.Operation != "mirroring" {
+		t.Errorf("Operation = %q", got.Operation)
+	}
+	if len(got.MirroredPorts) != 3 {
+		t.Errorf("MirroredPorts = %v", got.MirroredPorts)
+	}
+}
+
+// TestSwitchPort_BuildV2Body_SwitchingDropsMirroredPorts verifies that when
+// operation=="switching" the MirroredPorts slice is NOT forwarded, even if
+// the model contains ports (guard against accidental mirror activation).
+func TestSwitchPort_BuildV2Body_SwitchingDropsMirroredPorts(t *testing.T) {
+	ctx := context.Background()
+	ports, _ := types.SetValueFrom(ctx, types.Int64Type, []int64{1, 3})
+	m := &SwitchPortResourceModel{
+		Port:          types.Int64Value(7),
+		Operation:     types.StringValue("switching"),
+		MirroredPorts: ports, // present but must be ignored when not mirroring
+	}
+	var errs []error
+	got := buildSwitchPortV2Body(ctx, m, &errs)
+	if got.Operation != "switching" {
+		t.Errorf("Operation = %q", got.Operation)
+	}
+	if len(got.MirroredPorts) != 0 {
+		t.Errorf("MirroredPorts should be empty for switching, got %v", got.MirroredPorts)
+	}
+}
+
+// TestValidateMirrorConfig covers all plan-time validation rules for the
+// mirror fields: operation one-of check, ports-only-when-mirroring, no
+// self-mirror (src == dest), and port values >= 1.
+func TestValidateMirrorConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		operation string
+		srcPorts  []int64
+		destPort  int64
+		wantErr   bool
+	}{
+		{"mirroring ok", "mirroring", []int64{1, 3}, 12, false},
+		{"switching with ports", "switching", []int64{1}, 12, true},
+		{"mirroring includes dest", "mirroring", []int64{1, 12}, 12, true},
+		{"switching empty ok", "switching", nil, 7, false},
+		{"empty operation ok", "", nil, 7, false},
+		{"invalid operation", "bogus", nil, 7, true},
+		{"mirroring zero port", "mirroring", []int64{0}, 12, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateMirrorConfig(c.operation, c.srcPorts, c.destPort)
+			if (err != nil) != c.wantErr {
+				t.Errorf("err = %v, wantErr %v", err, c.wantErr)
+			}
+		})
 	}
 }
 

@@ -12,12 +12,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 var _ resource.Resource = &SwitchPortResource{}
 var _ resource.ResourceWithImportState = &SwitchPortResource{}
+var _ resource.ResourceWithValidateConfig = &SwitchPortResource{}
 
 // SwitchPortResource manages a single switch port via PATCH
 // /switches/{mac}/ports/{port}. Compared to omada_device_switch (which
@@ -47,6 +49,8 @@ type SwitchPortResourceModel struct {
 	VoiceNetworkEnable        types.Bool   `tfsdk:"voice_network_enable"`
 	VoiceDscpEnable           types.Bool   `tfsdk:"voice_dscp_enable"`
 	Speed                     types.Int64  `tfsdk:"speed"`
+	Operation                 types.String `tfsdk:"operation"`
+	MirroredPorts             types.Set    `tfsdk:"mirrored_ports"`
 }
 
 func NewSwitchPortResource() resource.Resource {
@@ -177,6 +181,17 @@ func (r *SwitchPortResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				Optional: true,
 				Computed: true,
 			},
+			"operation": schema.StringAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     stringdefault.StaticString("switching"),
+				Description: "Port role: \"switching\" (normal, default) or \"mirroring\" (this port is a SPAN destination).",
+			},
+			"mirrored_ports": schema.SetAttribute{
+				Optional:    true,
+				ElementType: types.Int64Type,
+				Description: "Source port numbers mirrored to this destination port. Only valid when operation = \"mirroring\". Order-independent.",
+			},
 		},
 	}
 }
@@ -286,7 +301,41 @@ func buildSwitchPortV2Body(ctx context.Context, m *SwitchPortResourceModel, diag
 		body.TagIDs = ids
 	}
 
+	operation := m.Operation.ValueString()
+	if operation == "" {
+		operation = "switching"
+	}
+	body.Operation = operation
+
+	if operation == "mirroring" && !m.MirroredPorts.IsNull() && !m.MirroredPorts.IsUnknown() {
+		var ports []int64
+		d := m.MirroredPorts.ElementsAs(ctx, &ports, false)
+		if d.HasError() {
+			for _, e := range d.Errors() {
+				*diags = append(*diags, fmt.Errorf("%s: %s", e.Summary(), e.Detail()))
+			}
+			return nil
+		}
+		body.MirroredPorts = make([]int, 0, len(ports))
+		for _, p := range ports {
+			body.MirroredPorts = append(body.MirroredPorts, int(p))
+		}
+	}
+
 	return body
+}
+
+// mirroredPortRefsToSet converts the per-switch GET mirroredPorts object array
+// into a Terraform types.Set of int64 port numbers. Order-independent: the set
+// type is inherently unordered, so terraform plan shows no drift regardless of
+// the order the controller returns ports.
+func mirroredPortRefsToSet(ctx context.Context, refs []client.MirroredPortRef) types.Set {
+	vals := make([]int64, 0, len(refs))
+	for _, r := range refs {
+		vals = append(vals, int64(r.Port))
+	}
+	set, _ := types.SetValueFrom(ctx, types.Int64Type, vals)
+	return set
 }
 
 // applySwitchPortToModel writes the API SwitchPort struct back into the
@@ -304,6 +353,13 @@ func applySwitchPortToModel(ctx context.Context, m *SwitchPortResourceModel, p *
 	m.VoiceNetworkEnable = types.BoolValue(p.VoiceNetworkEnable)
 	m.VoiceDscpEnable = types.BoolValue(p.VoiceDscpEnable)
 	m.Speed = types.Int64Value(int64(p.Speed))
+
+	operation := p.Operation
+	if operation == "" {
+		operation = "switching"
+	}
+	m.Operation = types.StringValue(operation)
+	m.MirroredPorts = mirroredPortRefsToSet(ctx, p.MirroredPorts)
 
 	if len(p.TagNetworkIDs) == 0 && m.TagNetworkIDs.IsNull() {
 		m.TagNetworkIDs = types.ListNull(types.StringType)
@@ -483,6 +539,64 @@ func (r *SwitchPortResource) ImportState(ctx context.Context, req resource.Impor
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// validateMirrorConfig performs plan-time validation of the mirror-related
+// fields. It is a pure function (no framework types) so it can be exercised
+// directly by unit tests without standing up a full provider.
+//
+// Rules:
+//  1. operation must be "" (not yet known), "switching", or "mirroring".
+//  2. mirrored_ports may only be set when operation == "mirroring".
+//  3. No source port may equal the destination port (destPort == model.Port).
+//  4. Every source port must be >= 1.
+func validateMirrorConfig(operation string, srcPorts []int64, destPort int64) error {
+	if operation != "" && operation != "switching" && operation != "mirroring" {
+		return fmt.Errorf("operation must be \"switching\" or \"mirroring\", got %q", operation)
+	}
+	if operation != "mirroring" {
+		if len(srcPorts) > 0 {
+			return fmt.Errorf("mirrored_ports may only be set when operation = \"mirroring\"")
+		}
+		return nil
+	}
+	for _, p := range srcPorts {
+		if p == destPort {
+			return fmt.Errorf("mirrored_ports must not include the destination port %d", destPort)
+		}
+		if p < 1 {
+			return fmt.Errorf("mirrored_ports values must be >= 1, got %d", p)
+		}
+	}
+	return nil
+}
+
+// ValidateConfig implements resource.ResourceWithValidateConfig. It provides
+// plan-time validation of the mirror configuration before any API call is made.
+func (r *SwitchPortResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var model SwitchPortResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &model)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// If mirrored_ports is unknown (e.g. a reference not yet resolved), skip
+	// validation — it will be re-run when the value is known.
+	if model.MirroredPorts.IsUnknown() {
+		return
+	}
+
+	var srcPorts []int64
+	if !model.MirroredPorts.IsNull() {
+		resp.Diagnostics.Append(model.MirroredPorts.ElementsAs(ctx, &srcPorts, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	if err := validateMirrorConfig(model.Operation.ValueString(), srcPorts, model.Port.ValueInt64()); err != nil {
+		resp.Diagnostics.AddError("Invalid port mirror configuration", err.Error())
+	}
 }
 
 // int64RequiresReplace forces a resource recreation when the int64 attribute
