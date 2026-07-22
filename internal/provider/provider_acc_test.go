@@ -37,6 +37,27 @@ func testSiteID(t *testing.T) string {
 	return id
 }
 
+// testDHCPReservationFixture returns the pre-existing interface network and
+// unused IP reserved for DHCP reservation acceptance tests. A disposable
+// purpose=interface network cannot be created on the hardwareless Docker
+// controller: the network resource requires a real gateway MAC and LAN port
+// binding
+func testDHCPReservationFixture(t *testing.T) (networkID, ip string) {
+	t.Helper()
+
+	networkID = os.Getenv("OMADA_TEST_DHCP_NETWORK_ID")
+	if networkID == "" {
+		t.Fatal("OMADA_TEST_DHCP_NETWORK_ID must be set for DHCP reservation acceptance tests")
+	}
+
+	ip = os.Getenv("OMADA_TEST_DHCP_IP")
+	if ip == "" {
+		t.Fatal("OMADA_TEST_DHCP_IP must be set for DHCP reservation acceptance tests")
+	}
+
+	return networkID, ip
+}
+
 // =============================================================================
 // Data Source: omada_sites
 // =============================================================================
@@ -377,6 +398,65 @@ data "omada_gateway_ports" "test" {
 					resource.TestCheckResourceAttrSet("data.omada_gateway_ports.test", "ports.#"),
 				),
 			},
+		},
+	})
+}
+
+// =============================================================================
+// Resource: dhcp_reservation (CRUD lifecycle)
+// =============================================================================
+func TestAccResourceDhcpReservation_CRUD(t *testing.T) {
+	siteID := testSiteID(t)
+	// The network must be an existing purpose=interface network with DHCP
+	// enabled. The IP must belong to that network and be reserved exclusively
+	// for this test. See docs/CONTRIBUTING.md for the fixture rationale.
+	dhcpNetworkID, dhcpIP := testDHCPReservationFixture(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+
+resource "omada_dhcp_reservation" "test" {
+  site_id    = %[1]q
+  network_id = %[2]q
+  mac        = "00-11-22-33-44-55"
+  ip         = %[3]q
+  description = "TF_ACC_TEST_DHCP_RESERVATION"
+  enabled     = true
+}
+
+`, siteID, dhcpNetworkID, dhcpIP),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("omada_dhcp_reservation.test", "id"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "description", "TF_ACC_TEST_DHCP_RESERVATION"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "enabled", "true"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "network_id", dhcpNetworkID),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "mac", "00-11-22-33-44-55"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "ip", dhcpIP),
+				),
+			},
+			// update step
+			{
+				Config: fmt.Sprintf(`
+resource "omada_dhcp_reservation" "test" {
+  site_id    = %[1]q
+  network_id = %[2]q
+  mac        = "00-11-22-33-44-55"
+  ip         = %[3]q
+  description = "TF_ACC_TEST_DHCP_RESERVATION_UPDATED"
+  enabled     = false
+}
+
+`, siteID, dhcpNetworkID, dhcpIP),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "description", "TF_ACC_TEST_DHCP_RESERVATION_UPDATED"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "enabled", "false"),
+				),
+			},
+			// Optional: import step (ImportState/ImportStateVerify)
 		},
 	})
 }

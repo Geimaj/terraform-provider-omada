@@ -60,6 +60,18 @@ export OMADA_TEST_SITE_ID='<24-char-site-hex-id>' # NOT the site name — the ID
 export OMADA_SKIP_TLS_VERIFY='true'               # for self-signed dev certs
 ```
 
+The DHCP reservation acceptance test additionally requires a pre-existing
+`purpose=interface` network with DHCP enabled and an unused address within
+that network:
+
+```bash
+export OMADA_TEST_DHCP_NETWORK_ID='<24-char-interface-network-id>'
+export OMADA_TEST_DHCP_IP='<unused-address-in-that-network>'
+```
+
+Reserve that address exclusively for acceptance testing. Do not point these
+variables at a production network.
+
 #### Find your site ID
 
 ```bash
@@ -75,6 +87,7 @@ Use the `id` field, not `name`.
 make testacc                    # all acceptance tests
 make testacc-data               # data sources only (read-only, safest)
 make testacc-network            # network resource lifecycle
+make testacc-dhcp-reservation   # DHCP reservation lifecycle (fixture required)
 ```
 
 The `testacc` target enforces required env vars and fails fast if missing.
@@ -119,6 +132,8 @@ Helpers in `internal/provider/provider_acc_test.go`:
 - `testAccProtoV6ProviderFactories` — provider factory map
 - `testAccPreCheck(t)` — asserts required env vars
 - `testSiteID(t)` — returns `OMADA_TEST_SITE_ID` or fails the test
+- `testDHCPReservationFixture(t)` — returns
+  `OMADA_TEST_DHCP_NETWORK_ID` and `OMADA_TEST_DHCP_IP`, or fails the test
 
 ### What the dev controller can and cannot validate
 
@@ -131,6 +146,7 @@ Helpers in `internal/provider/provider_acc_test.go`:
 | `omada_device_switch` | ❌ no device | ❌ no device | ✅ requires adoption |
 | `omada_switch_port` | ❌ no device | ❌ no device | ✅ requires adoption |
 | `omada_firewall_acl` | partial | partial | full |
+| `omada_dhcp_reservation` | ✅ existing interface-network fixture required | ✅ existing interface-network fixture required | ✅ existing interface-network fixture required |
 
 `purpose=vlan` networks work everywhere because they're L2-only and don't need gateway binding. Use those as your default test fixture.
 

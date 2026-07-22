@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -3669,4 +3670,110 @@ func (c *Client) ListGatewayPorts(ctx context.Context, siteID string) ([]Gateway
 		return []GatewayPort{}, nil
 	}
 	return result.OsgPortInfo.WanLanPortSettings, nil
+}
+
+// ============================================================================
+// DHCP Reservations
+// ============================================================================
+//
+// DHCP reservation info is exposed via /setting/service/dhcp. Each reservation has a
+// stable UUID, but reservations are addressable via the MAC address of the reserved device.
+// The MAC address is used as the unique key for create/update/delete operations.
+
+// DhcpReservation represents a single DHCP reservation.
+type DhcpReservation struct {
+	ID          string `json:"id,omitempty"`
+	NetworkID   string `json:"netId"`
+	MAC         string `json:"mac"`
+	ClientName  string `json:"clientName"`
+	IP          string `json:"ip"`
+	IPStart     int64  `json:"ipStart"`
+	IPEnd       int64  `json:"ipEnd"`
+	Description string `json:"description"`
+	Status      bool   `json:"status"`
+	NetworkName string `json:"netName"`
+}
+
+type DhcpReservationCreateRequest struct {
+	ID          string `json:"id,omitempty"`
+	NetworkID   string `json:"netId"`
+	MAC         string `json:"mac"`
+	ClientName  string `json:"clientName"`
+	IP          string `json:"ip"`
+	IPStart     int64  `json:"ipStart"`
+	IPEnd       int64  `json:"ipEnd"`
+	Description string `json:"description"`
+	Status      bool   `json:"status"`
+}
+
+type ListDhcpReservationsResult struct {
+	Reservations []DhcpReservation `json:"data"`
+	TotalRows    int               `json:"totalRows"`
+	CurrentPage  int               `json:"currentPage"`
+	CurrentSize  int               `json:"currentSize"`
+}
+
+func (c *Client) ListDhcpReservations(ctx context.Context, siteID string) ([]DhcpReservation, error) {
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodGet, "/setting/service/dhcp", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// todo: handle pagination if the controller returns more than one page of reservations
+
+	var result ListDhcpReservationsResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("decoding DHCP reservations: %w", err)
+	}
+	return result.Reservations, nil
+}
+
+// I didn't find the get endpoint, so here we list with the search key and then filter for the exact MAC address.
+// The controller returns a 200 with an empty list if the MAC is not found.
+func (c *Client) GetDHCPReservation(ctx context.Context, siteID string, mac string) (*DhcpReservation, error) {
+	resp, err := c.doSiteRequestWithParams(ctx, siteID, http.MethodGet, "/setting/service/dhcp", "currentPage=1&currentPageSize=10&searchKey="+url.QueryEscape(mac), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result ListDhcpReservationsResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("decoding DHCP reservations: %w", err)
+	}
+
+	for _, reservation := range result.Reservations {
+		if reservation.MAC == mac {
+			return &reservation, nil
+		}
+	}
+	return nil, fmt.Errorf("DHCP reservation with MAC %s not found", mac)
+}
+
+func (c *Client) CreateDHCPReservation(ctx context.Context, siteID string, req *DhcpReservationCreateRequest) (string, error) {
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/service/dhcp", req)
+	if err != nil {
+		return "", err
+	}
+
+	return string(resp.Result), nil
+}
+
+func (c *Client) UpdateDHCPReservation(ctx context.Context, siteID string, req *DhcpReservationCreateRequest) (bool, error) {
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPut, "/setting/service/dhcp/"+req.MAC, req)
+	if err != nil {
+		return false, err
+	}
+
+	return resp.Msg == "Success.", nil
+
+}
+
+func (c *Client) DeleteDHCPReservation(ctx context.Context, siteID string, mac string) (bool, error) {
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodDelete, "/setting/service/dhcp/"+mac, nil)
+	if err != nil {
+		return false, err
+	}
+
+	return resp.Msg == "Success.", nil
+
 }
