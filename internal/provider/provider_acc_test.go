@@ -61,10 +61,7 @@ func TestAccDataSourceSites(t *testing.T) {
 // =============================================================================
 
 func TestAccDataSourceNetworks(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9" // fallback: Iasi
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -89,10 +86,7 @@ data "omada_networks" "test" {
 // =============================================================================
 
 func TestAccDataSourceWirelessNetworks(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -117,10 +111,7 @@ data "omada_wireless_networks" "test" {
 // =============================================================================
 
 func TestAccDataSourcePortProfiles(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -145,10 +136,7 @@ data "omada_port_profiles" "test" {
 // =============================================================================
 
 func TestAccDataSourceDevices(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -173,10 +161,7 @@ data "omada_devices" "test" {
 // =============================================================================
 
 func TestAccDataSourceSiteSettings(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -203,10 +188,7 @@ data "omada_site_settings" "test" {
 // =============================================================================
 
 func TestAccResourceNetwork_CRUD(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -266,10 +248,7 @@ resource "omada_network" "test" {
 // =============================================================================
 
 func TestAccResourcePortProfile_CRUD(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -326,10 +305,7 @@ resource "omada_port_profile" "test" {
 // =============================================================================
 
 func TestAccDataSourceMDNSReflectors(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -356,10 +332,7 @@ data "omada_mdns_reflectors" "test" {
 // =============================================================================
 
 func TestAccDataSourceFirewallACLs(t *testing.T) {
-	siteID := os.Getenv("OMADA_TEST_SITE_ID")
-	if siteID == "" {
-		siteID = "696a40fd49039e1d13a9c3f9"
-	}
+	siteID := testSiteID(t)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -374,6 +347,34 @@ data "omada_firewall_acls" "test" {
 `, siteID),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("data.omada_firewall_acls.test", "acl_rules.#"),
+				),
+			},
+		},
+	})
+}
+
+// =============================================================================
+// Data Source: omada_gateway_ports
+// Lists WAN/LAN ports on the gateway. Returns the port template even when
+// no gateway has been adopted (controller-side template for the configured
+// model).
+// =============================================================================
+
+func TestAccDataSourceGatewayPorts(t *testing.T) {
+	siteID := testSiteID(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+data "omada_gateway_ports" "test" {
+  site_id = %q
+}
+`, siteID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("data.omada_gateway_ports.test", "ports.#"),
 				),
 			},
 		},

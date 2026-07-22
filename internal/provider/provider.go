@@ -4,13 +4,13 @@ import (
 	"context"
 	"os"
 
+	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
+	"github.com/Daily-Nerd/terraform-provider-omada/internal/resources"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
-	"github.com/Daily-Nerd/terraform-provider-omada/internal/resources"
 )
 
 var _ provider.Provider = &OmadaProvider{}
@@ -132,7 +132,9 @@ func (p *OmadaProvider) Resources(_ context.Context) []func() resource.Resource 
 		resources.NewWlanGroupResource,
 		resources.NewDeviceAPResource,
 		resources.NewDeviceSwitchResource,
+		resources.NewSwitchPortResource,
 		resources.NewACLRuleResource,
+		resources.NewFirewallACLOrderResource,
 		resources.NewIPGroupResource,
 		resources.NewMDNSReflectorResource,
 		resources.NewSAMLIdPResource,
@@ -152,6 +154,7 @@ func (p *OmadaProvider) DataSources(_ context.Context) []func() datasource.DataS
 		resources.NewFirewallACLsDataSource,
 		resources.NewIPGroupsDataSource,
 		resources.NewMDNSReflectorsDataSource,
+		resources.NewGatewayPortsDataSource,
 	}
 }
 

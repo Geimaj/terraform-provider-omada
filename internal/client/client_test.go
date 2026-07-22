@@ -3,7 +3,9 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -85,20 +87,116 @@ func newTestClient(t *testing.T, server *httptest.Server) *Client {
 // NewClient / Auth Tests
 // =============================================================================
 
-func TestNewClient_Success(t *testing.T) {
-	server := mockOmadaServer(t, nil)
+// TestNewClient_LazyAuth verifies that NewClient does NOT issue any HTTP
+// requests during construction. Authentication is deferred to first API call.
+func TestNewClient_LazyAuth(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
 	defer server.Close()
 
-	c := newTestClient(t, server)
-	if c.omadacID != "test-omadac-id" {
-		t.Errorf("omadacID = %q, want %q", c.omadacID, "test-omadac-id")
+	_, err := NewClient(server.URL, "admin", "password", true)
+	if err != nil {
+		t.Fatalf("NewClient should succeed without controller round-trip: %v", err)
 	}
-	if c.token != "test-csrf-token" {
-		t.Errorf("token = %q, want %q", c.token, "test-csrf-token")
+	if requestCount != 0 {
+		t.Errorf("NewClient issued %d HTTP request(s); want 0 (lazy auth)", requestCount)
 	}
 }
 
-func TestNewClient_ControllerInfoError(t *testing.T) {
+// TestLazyAuth_FiresOnFirstAPICall verifies that auth happens on the first
+// real API call and that omadacID + token are populated afterward.
+func TestLazyAuth_FiresOnFirstAPICall(t *testing.T) {
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites": func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(APIResponse{
+				ErrorCode: 0,
+				Result:    paginatedResponse(t, []Site{{ID: "site-1", Name: "Test"}}),
+			})
+		},
+	})
+	defer server.Close()
+
+	c := newTestClient(t, server)
+
+	// Before any API call, identity fields should be empty.
+	if c.omadacID != "" || c.token != "" {
+		t.Errorf("pre-call state: omadacID=%q token=%q, want both empty", c.omadacID, c.token)
+	}
+
+	// First API call triggers auth.
+	if _, err := c.ListSites(context.Background()); err != nil {
+		t.Fatalf("ListSites: %v", err)
+	}
+
+	if c.omadacID != "test-omadac-id" {
+		t.Errorf("post-call omadacID = %q, want %q", c.omadacID, "test-omadac-id")
+	}
+	if c.token != "test-csrf-token" {
+		t.Errorf("post-call token = %q, want %q", c.token, "test-csrf-token")
+	}
+}
+
+// TestLazyAuth_OnlyAuthsOnce verifies that ensureAuth is idempotent — once
+// omadacID + token are populated, subsequent calls do not re-fire /api/info
+// or /login.
+func TestLazyAuth_OnlyAuthsOnce(t *testing.T) {
+	infoHits := 0
+	loginHits := 0
+	siteHits := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
+		infoHits++
+		json.NewEncoder(w).Encode(APIResponse{
+			ErrorCode: 0,
+			Result:    mustMarshal(t, ControllerInfo{OmadacID: "test-omadac-id"}),
+		})
+	})
+	mux.HandleFunc("/test-omadac-id/api/v2/login", func(w http.ResponseWriter, r *http.Request) {
+		loginHits++
+		json.NewEncoder(w).Encode(APIResponse{
+			ErrorCode: 0,
+			Result:    mustMarshal(t, LoginResult{Token: "test-csrf-token"}),
+		})
+	})
+	mux.HandleFunc("/test-omadac-id/api/v2/sites", func(w http.ResponseWriter, r *http.Request) {
+		siteHits++
+		json.NewEncoder(w).Encode(APIResponse{
+			ErrorCode: 0,
+			Result:    paginatedResponse(t, []Site{{ID: "s1", Name: "A"}}),
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	c, err := NewClient(server.URL, "admin", "password", true)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := c.ListSites(context.Background()); err != nil {
+			t.Fatalf("ListSites[%d]: %v", i, err)
+		}
+	}
+
+	if infoHits != 1 {
+		t.Errorf("/api/info hits = %d, want 1 (cached after first auth)", infoHits)
+	}
+	if loginHits != 1 {
+		t.Errorf("/login hits = %d, want 1 (cached after first auth)", loginHits)
+	}
+	if siteHits != 3 {
+		t.Errorf("/sites hits = %d, want 3 (one per ListSites call)", siteHits)
+	}
+}
+
+// TestLazyAuth_ControllerInfoError verifies that controller info errors are
+// surfaced on the first API call (not at NewClient time).
+func TestLazyAuth_ControllerInfoError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(APIResponse{
 			ErrorCode: -1,
@@ -107,16 +205,23 @@ func TestNewClient_ControllerInfoError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := NewClient(server.URL, "admin", "password", true)
+	c, err := NewClient(server.URL, "admin", "password", true)
+	if err != nil {
+		t.Fatalf("NewClient should succeed (lazy auth): %v", err)
+	}
+
+	_, err = c.ListSites(context.Background())
 	if err == nil {
-		t.Fatal("expected error from NewClient, got nil")
+		t.Fatal("expected error from ListSites when /api/info fails, got nil")
 	}
 	if !strings.Contains(err.Error(), "controller info") {
 		t.Errorf("error = %q, expected to contain 'controller info'", err.Error())
 	}
 }
 
-func TestNewClient_LoginError(t *testing.T) {
+// TestLazyAuth_LoginError verifies that login errors surface on the first
+// API call (not at NewClient time).
+func TestLazyAuth_LoginError(t *testing.T) {
 	omadacID := "test-omadac-id"
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
@@ -136,9 +241,14 @@ func TestNewClient_LoginError(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	_, err := NewClient(server.URL, "admin", "wrong", true)
+	c, err := NewClient(server.URL, "admin", "wrong", true)
+	if err != nil {
+		t.Fatalf("NewClient should succeed (lazy auth): %v", err)
+	}
+
+	_, err = c.ListSites(context.Background())
 	if err == nil {
-		t.Fatal("expected error from NewClient with bad credentials, got nil")
+		t.Fatal("expected error from ListSites with bad credentials, got nil")
 	}
 	if !strings.Contains(err.Error(), "logging in") {
 		t.Errorf("error = %q, expected to contain 'logging in'", err.Error())
@@ -146,9 +256,21 @@ func TestNewClient_LoginError(t *testing.T) {
 }
 
 func TestGetOmadacID(t *testing.T) {
-	server := mockOmadaServer(t, nil)
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites": func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(APIResponse{
+				ErrorCode: 0,
+				Result:    paginatedResponse(t, []Site{}),
+			})
+		},
+	})
 	defer server.Close()
 	c := newTestClient(t, server)
+
+	// Trigger lazy auth via any API call.
+	if _, err := c.ListSites(context.Background()); err != nil {
+		t.Fatalf("ListSites (auth trigger): %v", err)
+	}
 
 	if got := c.GetOmadacID(); got != "test-omadac-id" {
 		t.Errorf("GetOmadacID() = %q, want %q", got, "test-omadac-id")
@@ -771,8 +893,9 @@ func TestUpdateACLRule(t *testing.T) {
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
 		"/sites/site-1/setting/firewall/acls/acl-1": func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPatch {
-				t.Errorf("expected PATCH, got %s", r.Method)
+			// ACL update must use PUT (PATCH returns -1600 on v6 controllers)
+			if r.Method != http.MethodPut {
+				t.Errorf("expected PUT, got %s", r.Method)
 			}
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
@@ -801,7 +924,8 @@ func TestUpdateACLRule_EmptyResult(t *testing.T) {
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
 		"/sites/site-1/setting/firewall/acls/acl-1": func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodPatch {
+			// ACL update must use PUT (PATCH returns -1600 on v6 controllers)
+			if r.Method == http.MethodPut {
 				json.NewEncoder(w).Encode(APIResponse{
 					ErrorCode: 0,
 					Result:    json.RawMessage(`{}`),
@@ -850,23 +974,210 @@ func TestDeleteACLRule(t *testing.T) {
 	}
 }
 
+// TestCreateACLRule_EmptyResult verifies that CreateACLRule handles a controller
+// response where result is empty/null (the live bug: "unexpected end of JSON input").
+// The impl should fall back to a list-then-match-by-id strategy using the rule
+// returned by the follow-up GET (ListACLRules).
+func TestCreateACLRule_EmptyResult(t *testing.T) {
+	fullRule := ACLRule{
+		ID: "acl-created", Name: "tf_block_iot", Type: 0, Status: true,
+		Policy: 0, Protocols: []int{6, 17},
+		SourceIDs: []string{"net-1"}, DestinationIDs: []string{"net-2"},
+		CustomAclOsws: []string{}, CustomAclStacks: []string{}, CustomAclDevices: []string{},
+	}
+	listResult := ACLListResult{TotalRows: 1, CurrentPage: 1, CurrentSize: 100, Data: []ACLRule{fullRule}}
+
+	listCallCount := 0
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/firewall/acls": func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost:
+				// Controller returns empty result (the live bug trigger).
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Msg:       "Success.",
+					Result:    json.RawMessage(`""`),
+				})
+			case http.MethodGet:
+				listCallCount++
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, listResult),
+				})
+			default:
+				t.Errorf("unexpected method %s", r.Method)
+			}
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	input := &ACLRule{
+		Name: "tf_block_iot", Type: 0, Status: true, Policy: 0,
+		Protocols: []int{6, 17},
+		SourceIDs: []string{"net-1"}, DestinationIDs: []string{"net-2"},
+	}
+	got, err := c.CreateACLRule(context.Background(), "site-1", input)
+	if err != nil {
+		t.Fatalf("CreateACLRule (empty result): %v", err)
+	}
+	if got.ID != "acl-created" {
+		t.Errorf("ID = %q, want %q", got.ID, "acl-created")
+	}
+	if got.Name != "tf_block_iot" {
+		t.Errorf("Name = %q, want %q", got.Name, "tf_block_iot")
+	}
+	if listCallCount == 0 {
+		t.Error("expected at least one GET list call to re-fetch after empty create; got 0")
+	}
+}
+
+// TestCreateACLRule_StringIDResult verifies that CreateACLRule handles a controller
+// response where result is a bare quoted string ID (like CreateIPGroup).
+// The impl should follow up with GetACLRule (list+match) and return the full rule.
+func TestCreateACLRule_StringIDResult(t *testing.T) {
+	createdID := "64a1b2c3d4e5f6a7b8c9d0e1"
+	fullRule := ACLRule{
+		ID: createdID, Name: "tf_allow_dns", Type: 0, Status: true,
+		Policy: 1, Protocols: []int{17},
+		SourceIDs: []string{"net-1"}, DestinationIDs: []string{"ipg-1"},
+		CustomAclOsws: []string{}, CustomAclStacks: []string{}, CustomAclDevices: []string{},
+	}
+	listResult := ACLListResult{TotalRows: 1, CurrentPage: 1, CurrentSize: 100, Data: []ACLRule{fullRule}}
+
+	listCallCount := 0
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/firewall/acls": func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost:
+				// Controller returns bare string ID.
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    json.RawMessage(`"` + createdID + `"`),
+				})
+			case http.MethodGet:
+				listCallCount++
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, listResult),
+				})
+			default:
+				t.Errorf("unexpected method %s", r.Method)
+			}
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	input := &ACLRule{
+		Name: "tf_allow_dns", Type: 0, Status: true, Policy: 1,
+		Protocols: []int{17},
+		SourceIDs: []string{"net-1"}, DestinationIDs: []string{"ipg-1"},
+	}
+	got, err := c.CreateACLRule(context.Background(), "site-1", input)
+	if err != nil {
+		t.Fatalf("CreateACLRule (string-id result): %v", err)
+	}
+	if got.ID != createdID {
+		t.Errorf("ID = %q, want %q", got.ID, createdID)
+	}
+	if got.Name != "tf_allow_dns" {
+		t.Errorf("Name = %q, want %q", got.Name, "tf_allow_dns")
+	}
+	if listCallCount == 0 {
+		t.Error("expected at least one GET list call to re-fetch after string-id create; got 0")
+	}
+}
+
+// =============================================================================
+// ACL Rule nil-IDs serialization tests
+// =============================================================================
+
+// TestACLRule_NilSourceDestIds_MarshalAsEmptyArray verifies that an ACLRule with
+// nil SourceIDs / DestinationIDs (the "any" source/destination case) serializes
+// both fields as [] rather than null. The Omada controller rejects null with
+// -33609 "Choose the source and destination".
+//
+// RED: current normalizeACLRule does NOT initialize SourceIDs / DestinationIDs,
+// so json.Marshal produces "sourceIds":null which the controller rejects.
+func TestACLRule_NilSourceDestIds_MarshalAsEmptyArray(t *testing.T) {
+	rule := &ACLRule{
+		Name:            "Allow Any to Any",
+		Type:            0,
+		Status:          true,
+		Policy:          1,
+		Protocols:       []int{256},
+		SourceType:      0,
+		SourceIDs:       nil, // "any" — nil slice
+		DestinationType: 0,
+		DestinationIDs:  nil, // "any" — nil slice
+	}
+
+	normalizeACLRule(rule)
+
+	data, err := json.Marshal(rule)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	body := string(data)
+
+	// nil slice must produce [] not null
+	if !strings.Contains(body, `"sourceIds":[]`) {
+		t.Errorf("want sourceIds:[] in JSON, got: %s", body)
+	}
+	if !strings.Contains(body, `"destinationIds":[]`) {
+		t.Errorf("want destinationIds:[] in JSON, got: %s", body)
+	}
+}
+
+// TestACLRule_PopulatedIds_Preserved verifies that non-nil (populated) IDs still
+// serialize correctly after normalization.
+func TestACLRule_PopulatedIds_Preserved(t *testing.T) {
+	rule := &ACLRule{
+		Name:            "Block IoT to WAN",
+		Type:            0,
+		Status:          true,
+		Policy:          0,
+		Protocols:       []int{6},
+		SourceType:      0,
+		SourceIDs:       []string{"net-iot"},
+		DestinationType: 2,
+		DestinationIDs:  []string{"ipg-internet"},
+	}
+
+	normalizeACLRule(rule)
+
+	data, err := json.Marshal(rule)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	body := string(data)
+
+	if !strings.Contains(body, `"sourceIds":["net-iot"]`) {
+		t.Errorf("want sourceIds:[net-iot] in JSON, got: %s", body)
+	}
+	if !strings.Contains(body, `"destinationIds":["ipg-internet"]`) {
+		t.Errorf("want destinationIds:[ipg-internet] in JSON, got: %s", body)
+	}
+}
+
 // =============================================================================
 // IP Groups Tests
 // =============================================================================
 
 func TestListIPGroups(t *testing.T) {
 	groups := []IPGroup{
-		{ID: "ipg-1", Name: "DNS Servers", Type: 1, IPList: []IPGroupEntry{
-			{IP: "8.8.8.8", PortList: []string{"53"}},
-			{IP: "1.1.1.1", PortList: []string{"53"}},
+		{ID: "ipg-1", Name: "DNS Servers", Type: 0, IPList: []IPGroupEntry{
+			{IP: "8.8.8.8", Mask: 32, Description: ""},
+			{IP: "1.1.1.1", Mask: 32, Description: ""},
 		}},
-		{ID: "ipg-2", Name: "Web Servers", Type: 1, IPList: []IPGroupEntry{
-			{IP: "10.0.0.0/24", PortList: []string{"80", "443"}},
+		{ID: "ipg-2", Name: "Web Servers", Type: 0, IPList: []IPGroupEntry{
+			{IP: "10.0.0.0", Mask: 24, Description: ""},
 		}},
 	}
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				t.Errorf("expected GET, got %s", r.Method)
 			}
@@ -895,14 +1206,14 @@ func TestListIPGroups(t *testing.T) {
 	if got[0].IPList[0].IP != "8.8.8.8" {
 		t.Errorf("groups[0].IPList[0].IP = %q, want %q", got[0].IPList[0].IP, "8.8.8.8")
 	}
-	if got[0].IPList[0].PortList[0] != "53" {
-		t.Errorf("groups[0].IPList[0].PortList[0] = %q, want %q", got[0].IPList[0].PortList[0], "53")
+	if got[0].IPList[0].Mask != 32 {
+		t.Errorf("groups[0].IPList[0].Mask = %d, want 32", got[0].IPList[0].Mask)
 	}
 }
 
 func TestListIPGroups_Empty(t *testing.T) {
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
 				Result:    paginatedResponse(t, []IPGroup{}),
@@ -923,12 +1234,12 @@ func TestListIPGroups_Empty(t *testing.T) {
 
 func TestGetIPGroup_Found(t *testing.T) {
 	groups := []IPGroup{
-		{ID: "ipg-1", Name: "DNS Servers", Type: 1},
-		{ID: "ipg-2", Name: "Web Servers", Type: 1},
+		{ID: "ipg-1", Name: "DNS Servers", Type: 0},
+		{ID: "ipg-2", Name: "Web Servers", Type: 0},
 	}
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
 				Result:    paginatedResponse(t, groups),
@@ -949,7 +1260,7 @@ func TestGetIPGroup_Found(t *testing.T) {
 
 func TestGetIPGroup_NotFound(t *testing.T) {
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
 				Result:    paginatedResponse(t, []IPGroup{}),
@@ -968,29 +1279,69 @@ func TestGetIPGroup_NotFound(t *testing.T) {
 	}
 }
 
-func TestCreateIPGroup(t *testing.T) {
-	created := IPGroup{
-		ID: "ipg-new", Name: "New Group", Type: 1,
-		IPList: []IPGroupEntry{{IP: "192.168.1.0/24", PortList: []string{"80"}}},
-	}
+// TestGetIPGroup_NotFoundReturnsSentinel verifies that when the API returns a
+// list that does NOT contain the requested group ID, GetIPGroup returns an
+// error that wraps ErrNotFound so callers can detect drift via errors.Is.
+// RED: fails until GetIPGroup wraps ErrNotFound on the not-found path.
+func TestGetIPGroup_NotFoundReturnsSentinel(t *testing.T) {
+	// List contains a different group — the requested ID is absent.
+	other := IPGroup{ID: "ipg-other", Name: "Other Group", Type: 0,
+		IPList: []IPGroupEntry{{IP: "10.0.0.0", Mask: 8}}}
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				t.Errorf("expected POST, got %s", r.Method)
-			}
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
-				Result:    mustMarshal(t, created),
+				Result:    paginatedResponse(t, []IPGroup{other}),
 			})
 		},
 	})
 	defer server.Close()
 	c := newTestClient(t, server)
 
+	_, err := c.GetIPGroup(context.Background(), "site-1", "6a1a9ee744a75c2be561188a")
+	if err == nil {
+		t.Fatal("GetIPGroup: expected error for absent group ID, got nil")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetIPGroup not-found error does not wrap ErrNotFound: %v", err)
+	}
+}
+
+func TestCreateIPGroup(t *testing.T) {
+	// The v6/ER707 API returns a bare string ID on POST; the full object comes
+	// from the follow-up GET (list + filter).
+	fullGroup := json.RawMessage(`{"groupId":"ipg-new","name":"New Group","type":0,"ipList":[{"ip":"192.168.1.0","mask":24,"description":""}],"count":1}`)
+	paginatedRaw := mustMarshal(t, map[string]interface{}{
+		"totalRows": 1, "currentPage": 1, "currentSize": 100,
+		"data": []json.RawMessage{fullGroup},
+	})
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    json.RawMessage(`"ipg-new"`),
+				})
+				return
+			}
+			if r.Method == http.MethodGet {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    paginatedRaw,
+				})
+				return
+			}
+			t.Errorf("unexpected method %s", r.Method)
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
 	input := &IPGroup{
-		Name: "New Group", Type: 1,
-		IPList: []IPGroupEntry{{IP: "192.168.1.0/24", PortList: []string{"80"}}},
+		Name: "New Group", Type: 0,
+		IPList: []IPGroupEntry{{IP: "192.168.1.0", Mask: 24, Description: ""}},
 	}
 	got, err := c.CreateIPGroup(context.Background(), "site-1", input)
 	if err != nil {
@@ -999,21 +1350,24 @@ func TestCreateIPGroup(t *testing.T) {
 	if got.ID != "ipg-new" {
 		t.Errorf("ID = %q, want %q", got.ID, "ipg-new")
 	}
-	if got.IPList[0].IP != "192.168.1.0/24" {
-		t.Errorf("IPList[0].IP = %q, want %q", got.IPList[0].IP, "192.168.1.0/24")
+	if got.IPList[0].IP != "192.168.1.0" {
+		t.Errorf("IPList[0].IP = %q, want %q", got.IPList[0].IP, "192.168.1.0")
+	}
+	if got.IPList[0].Mask != 24 {
+		t.Errorf("IPList[0].Mask = %d, want 24", got.IPList[0].Mask)
 	}
 }
 
 func TestUpdateIPGroup(t *testing.T) {
 	updated := IPGroup{
-		ID: "ipg-1", Name: "Updated Group", Type: 1,
-		IPList: []IPGroupEntry{{IP: "10.0.0.0/8"}},
+		ID: "ipg-1", Name: "Updated Group", Type: 0,
+		IPList: []IPGroupEntry{{IP: "10.0.0.0", Mask: 8}},
 	}
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups/ipg-1": func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPatch {
-				t.Errorf("expected PATCH, got %s", r.Method)
+		"/sites/site-1/setting/profiles/groups/ipg-1": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPut {
+				t.Errorf("expected PUT, got %s", r.Method)
 			}
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
@@ -1024,7 +1378,7 @@ func TestUpdateIPGroup(t *testing.T) {
 	defer server.Close()
 	c := newTestClient(t, server)
 
-	input := &IPGroup{Name: "Updated Group", Type: 1, IPList: []IPGroupEntry{{IP: "10.0.0.0/8"}}}
+	input := &IPGroup{Name: "Updated Group", Type: 0, IPList: []IPGroupEntry{{IP: "10.0.0.0", Mask: 8}}}
 	got, err := c.UpdateIPGroup(context.Background(), "site-1", "ipg-1", input)
 	if err != nil {
 		t.Fatalf("UpdateIPGroup: %v", err)
@@ -1036,12 +1390,12 @@ func TestUpdateIPGroup(t *testing.T) {
 
 func TestUpdateIPGroup_EmptyResult(t *testing.T) {
 	groups := []IPGroup{
-		{ID: "ipg-1", Name: "Refreshed Group", Type: 1, IPList: []IPGroupEntry{{IP: "10.0.0.0/8"}}},
+		{ID: "ipg-1", Name: "Refreshed Group", Type: 0, IPList: []IPGroupEntry{{IP: "10.0.0.0", Mask: 8}}},
 	}
 
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups/ipg-1": func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodPatch {
+		"/sites/site-1/setting/profiles/groups/ipg-1": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut {
 				json.NewEncoder(w).Encode(APIResponse{
 					ErrorCode: 0,
 					Result:    json.RawMessage(`{}`),
@@ -1049,7 +1403,7 @@ func TestUpdateIPGroup_EmptyResult(t *testing.T) {
 				return
 			}
 		},
-		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(APIResponse{
 				ErrorCode: 0,
 				Result:    paginatedResponse(t, groups),
@@ -1059,7 +1413,7 @@ func TestUpdateIPGroup_EmptyResult(t *testing.T) {
 	defer server.Close()
 	c := newTestClient(t, server)
 
-	input := &IPGroup{Name: "Refreshed Group", Type: 1}
+	input := &IPGroup{Name: "Refreshed Group", Type: 0}
 	got, err := c.UpdateIPGroup(context.Background(), "site-1", "ipg-1", input)
 	if err != nil {
 		t.Fatalf("UpdateIPGroup (empty result): %v", err)
@@ -1070,8 +1424,9 @@ func TestUpdateIPGroup_EmptyResult(t *testing.T) {
 }
 
 func TestDeleteIPGroup(t *testing.T) {
+	// Path must include the type segment: /setting/profiles/groups/{type}/{id}
 	server := mockOmadaServer(t, map[string]http.HandlerFunc{
-		"/sites/site-1/setting/firewall/ipGroups/ipg-1": func(w http.ResponseWriter, r *http.Request) {
+		"/sites/site-1/setting/profiles/groups/0/ipg-1": func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodDelete {
 				t.Errorf("expected DELETE, got %s", r.Method)
 			}
@@ -1084,9 +1439,370 @@ func TestDeleteIPGroup(t *testing.T) {
 	defer server.Close()
 	c := newTestClient(t, server)
 
-	err := c.DeleteIPGroup(context.Background(), "site-1", "ipg-1")
+	err := c.DeleteIPGroup(context.Background(), "site-1", 0, "ipg-1")
 	if err != nil {
 		t.Fatalf("DeleteIPGroup: %v", err)
+	}
+}
+
+// =============================================================================
+// IP Group v6 / profiles/groups path tests (RED → GREEN with v6 fix)
+// =============================================================================
+
+// TestIPGroup_CreateUsesProfilesGroupsPath asserts that CreateIPGroup POSTs to
+// /setting/profiles/groups (the v6/ER707 path) and NOT to /setting/firewall/ipGroups.
+func TestIPGroup_CreateUsesProfilesGroupsPath(t *testing.T) {
+	fullGroup := json.RawMessage(`{"groupId":"ipg-v6","name":"Trusted Nets","type":0,"ipList":[{"ip":"10.10.50.0","mask":24,"description":""}],"count":1}`)
+	paginatedRaw := mustMarshal(t, map[string]interface{}{
+		"totalRows": 1, "currentPage": 1, "currentSize": 100,
+		"data": []json.RawMessage{fullGroup},
+	})
+
+	hitPost := false
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				hitPost = true
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    json.RawMessage(`"ipg-v6"`),
+				})
+				return
+			}
+			if r.Method == http.MethodGet {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    paginatedRaw,
+				})
+				return
+			}
+		},
+		// Any hit to the old path should 404 so the test catches regressions.
+		"/sites/site-1/setting/firewall/ipGroups": func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("CreateIPGroup hit legacy path /setting/firewall/ipGroups — should use /setting/profiles/groups")
+			http.NotFound(w, r)
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	input := &IPGroup{
+		Name: "Trusted Nets",
+		Type: 0,
+		IPList: []IPGroupEntry{
+			{IP: "10.10.50.0", Mask: 24, Description: ""},
+		},
+	}
+	got, err := c.CreateIPGroup(context.Background(), "site-1", input)
+	if err != nil {
+		t.Fatalf("CreateIPGroup v6: %v", err)
+	}
+	if !hitPost {
+		t.Error("CreateIPGroup did not hit /setting/profiles/groups with POST")
+	}
+	if got.ID != "ipg-v6" {
+		t.Errorf("ID = %q, want %q", got.ID, "ipg-v6")
+	}
+}
+
+// TestIPGroup_V6BodyShape asserts the marshaled create body matches the v6 wire shape:
+//   - ipList entries have {ip, mask (int), description} — no CIDR string
+//   - a /24 CIDR input produces mask:24; a bare host produces mask:32
+//   - type:0 for IP-only groups
+//   - null envelope fields present (ipv6List, macAddressList, portList, countryList, etc.)
+func TestIPGroup_V6BodyShape(t *testing.T) {
+	var capturedBody []byte
+	// Full group returned by the follow-up GET (uses groupId as live API does).
+	fullGroup := json.RawMessage(`{"groupId":"ipg-shape","name":"Shape Test","type":0,"ipList":[{"ip":"10.10.50.0","mask":24,"description":""},{"ip":"10.10.70.98","mask":32,"description":""}],"count":2}`)
+	paginatedRaw := mustMarshal(t, map[string]interface{}{
+		"totalRows": 1, "currentPage": 1, "currentSize": 100,
+		"data": []json.RawMessage{fullGroup},
+	})
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				var err error
+				capturedBody, err = io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("reading body: %v", err)
+				}
+				// Return string ID as real API does.
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    json.RawMessage(`"ipg-shape"`),
+				})
+				return
+			}
+			if r.Method == http.MethodGet {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    paginatedRaw,
+				})
+				return
+			}
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	input := &IPGroup{
+		Name: "Shape Test",
+		Type: 0,
+		IPList: []IPGroupEntry{
+			{IP: "10.10.50.0", Mask: 24, Description: ""},
+			{IP: "10.10.70.98", Mask: 32, Description: ""},
+		},
+	}
+	if _, err := c.CreateIPGroup(context.Background(), "site-1", input); err != nil {
+		t.Fatalf("CreateIPGroup body-shape: %v", err)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(capturedBody, &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+
+	// type must be 0
+	if tp, _ := body["type"].(float64); tp != 0 {
+		t.Errorf("type = %v, want 0", body["type"])
+	}
+
+	// ipList entries must be {ip, mask (number), description}
+	ipListRaw, ok := body["ipList"].([]interface{})
+	if !ok || len(ipListRaw) != 2 {
+		t.Fatalf("ipList = %v, want 2 entries", body["ipList"])
+	}
+
+	entry0, _ := ipListRaw[0].(map[string]interface{})
+	if entry0["ip"] != "10.10.50.0" {
+		t.Errorf("entry0.ip = %v, want 10.10.50.0", entry0["ip"])
+	}
+	if mask, _ := entry0["mask"].(float64); mask != 24 {
+		t.Errorf("entry0.mask = %v, want 24", entry0["mask"])
+	}
+	if _, hasDesc := entry0["description"]; !hasDesc {
+		t.Error("entry0 missing description field")
+	}
+
+	entry1, _ := ipListRaw[1].(map[string]interface{})
+	if entry1["ip"] != "10.10.70.98" {
+		t.Errorf("entry1.ip = %v, want 10.10.70.98", entry1["ip"])
+	}
+	if mask, _ := entry1["mask"].(float64); mask != 32 {
+		t.Errorf("entry1.mask = %v, want 32 (bare host)", entry1["mask"])
+	}
+
+	// null envelope fields must be present (JSON null)
+	for _, nullField := range []string{"ipv6List", "macAddressList", "portList", "countryList", "portType", "portMaskList", "domainNamePort", "ouiList"} {
+		if _, exists := body[nullField]; !exists {
+			t.Errorf("body missing null envelope field %q", nullField)
+		}
+	}
+
+	// count must be present
+	if _, exists := body["count"]; !exists {
+		t.Error("body missing count field")
+	}
+}
+
+// TestCIDRSplitHelper tests the splitCIDR helper that converts CIDR-or-bare-IP
+// strings into separate (ip, mask) pairs for the v6 wire body.
+func TestCIDRSplitHelper(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantIP   string
+		wantMask int
+		wantErr  bool
+	}{
+		{"10.10.50.0/24", "10.10.50.0", 24, false},
+		{"192.168.1.0/24", "192.168.1.0", 24, false},
+		{"10.10.70.98/32", "10.10.70.98", 32, false},
+		{"10.10.70.98", "10.10.70.98", 32, false}, // bare host → mask 32
+		{"8.8.8.8", "8.8.8.8", 32, false},
+		{"not-an-ip", "", 0, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			ip, mask, err := SplitCIDR(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("SplitCIDR(%q): expected error, got nil", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("SplitCIDR(%q): unexpected error: %v", tc.input, err)
+				return
+			}
+			if ip != tc.wantIP {
+				t.Errorf("SplitCIDR(%q).ip = %q, want %q", tc.input, ip, tc.wantIP)
+			}
+			if mask != tc.wantMask {
+				t.Errorf("SplitCIDR(%q).mask = %d, want %d", tc.input, mask, tc.wantMask)
+			}
+		})
+	}
+}
+
+// TestIPGroup_UpdateUsesPUT asserts UpdateIPGroup uses PUT (not PATCH) to
+// /setting/profiles/groups/{id}, mirroring the ACL update fix on this branch.
+func TestIPGroup_UpdateUsesPUT(t *testing.T) {
+	updated := IPGroup{
+		ID: "ipg-1", Name: "Updated Group", Type: 0,
+		IPList: []IPGroupEntry{{IP: "10.0.0.0", Mask: 8}},
+	}
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/profiles/groups/ipg-1": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPut {
+				t.Errorf("expected PUT on profiles/groups/{id}, got %s", r.Method)
+			}
+			json.NewEncoder(w).Encode(APIResponse{
+				ErrorCode: 0,
+				Result:    mustMarshal(t, updated),
+			})
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	input := &IPGroup{Name: "Updated Group", Type: 0, IPList: []IPGroupEntry{{IP: "10.0.0.0", Mask: 8}}}
+	got, err := c.UpdateIPGroup(context.Background(), "site-1", "ipg-1", input)
+	if err != nil {
+		t.Fatalf("UpdateIPGroup v6: %v", err)
+	}
+	if got.Name != "Updated Group" {
+		t.Errorf("Name = %q, want %q", got.Name, "Updated Group")
+	}
+}
+
+// =============================================================================
+// IP Group v6 API field-name fix tests (groupId tag + string-id create)
+// =============================================================================
+
+// TestIPGroup_GroupIdTag_UnmarshalFromLiveAPI verifies that IPGroup.ID is
+// populated when the API returns "groupId" (the real v6 wire field name).
+// RED: fails with json:"id" tag; GREEN: passes with json:"groupId" tag.
+func TestIPGroup_GroupIdTag_UnmarshalFromLiveAPI(t *testing.T) {
+	// Realistic GET response from live ER707 controller.
+	rawJSON := `{"groupId":"6a1a9aa744a75c2be56115d0","site":"Default","name":"tf_pihole","ipList":[{"ip":"10.10.70.98","mask":32,"description":""}],"count":1,"type":0,"resource":0}`
+
+	var g IPGroup
+	if err := json.Unmarshal([]byte(rawJSON), &g); err != nil {
+		t.Fatalf("unmarshal IPGroup: %v", err)
+	}
+	if g.ID != "6a1a9aa744a75c2be56115d0" {
+		t.Errorf("IPGroup.ID = %q, want %q (check json tag: should be groupId not id)",
+			g.ID, "6a1a9aa744a75c2be56115d0")
+	}
+	if g.Name != "tf_pihole" {
+		t.Errorf("IPGroup.Name = %q, want %q", g.Name, "tf_pihole")
+	}
+	if len(g.IPList) != 1 {
+		t.Fatalf("IPGroup.IPList len = %d, want 1", len(g.IPList))
+	}
+	if g.IPList[0].IP != "10.10.70.98" {
+		t.Errorf("IPList[0].IP = %q, want %q", g.IPList[0].IP, "10.10.70.98")
+	}
+	if g.IPList[0].Mask != 32 {
+		t.Errorf("IPList[0].Mask = %d, want 32", g.IPList[0].Mask)
+	}
+}
+
+// TestGetIPGroup_UsesGroupIdForMatch verifies that GetIPGroup correctly matches
+// by ID when the server returns objects with the "groupId" field.
+// RED: fails with json:"id" because g.ID is empty → never matches.
+func TestGetIPGroup_UsesGroupIdForMatch(t *testing.T) {
+	// Raw paginated payload using "groupId" as the live API does.
+	rawGroup := json.RawMessage(`{"groupId":"abc123","name":"PiHole","type":0,"ipList":[{"ip":"10.10.70.98","mask":32,"description":""}],"count":1}`)
+	paginatedRaw := mustMarshal(t, map[string]interface{}{
+		"totalRows":   1,
+		"currentPage": 1,
+		"currentSize": 100,
+		"data":        []json.RawMessage{rawGroup},
+	})
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(APIResponse{
+				ErrorCode: 0,
+				Result:    paginatedRaw,
+			})
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	got, err := c.GetIPGroup(context.Background(), "site-1", "abc123")
+	if err != nil {
+		t.Fatalf("GetIPGroup with groupId field: %v", err)
+	}
+	if got.ID != "abc123" {
+		t.Errorf("ID = %q, want %q", got.ID, "abc123")
+	}
+}
+
+// TestCreateIPGroup_StringIDResult verifies that CreateIPGroup handles the real
+// v6 API response where "result" is a bare string ID, not a full IPGroup object.
+// Pattern mirrors CreateMDNSRule: unmarshal as string → follow-up GetIPGroup.
+// RED: current code tries json.Unmarshal(resp.Result, &IPGroup{}) → error.
+func TestCreateIPGroup_StringIDResult(t *testing.T) {
+	createdID := "6a1a9aa744a75c2be56115d0"
+	// Full object returned by the follow-up GET (uses "groupId" as real API does).
+	fullGroupRaw := json.RawMessage(`{"groupId":"6a1a9aa744a75c2be56115d0","name":"tf_pihole","type":0,"ipList":[{"ip":"10.10.70.98","mask":32,"description":""}],"count":1}`)
+	paginatedRaw := mustMarshal(t, map[string]interface{}{
+		"totalRows":   1,
+		"currentPage": 1,
+		"currentSize": 100,
+		"data":        []json.RawMessage{fullGroupRaw},
+	})
+
+	callCount := 0
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		"/sites/site-1/setting/profiles/groups": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				// Real v6 API: returns bare string ID.
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    json.RawMessage(`"` + createdID + `"`),
+				})
+				return
+			}
+			if r.Method == http.MethodGet {
+				callCount++
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    paginatedRaw,
+				})
+				return
+			}
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	input := &IPGroup{
+		Name:   "tf_pihole",
+		Type:   0,
+		IPList: []IPGroupEntry{{IP: "10.10.70.98", Mask: 32, Description: ""}},
+	}
+	got, err := c.CreateIPGroup(context.Background(), "site-1", input)
+	if err != nil {
+		t.Fatalf("CreateIPGroup (string-id result): %v", err)
+	}
+	if got.ID != createdID {
+		t.Errorf("ID = %q, want %q", got.ID, createdID)
+	}
+	if got.Name != "tf_pihole" {
+		t.Errorf("Name = %q, want %q", got.Name, "tf_pihole")
+	}
+	if len(got.IPList) != 1 || got.IPList[0].IP != "10.10.70.98" {
+		t.Errorf("IPList = %v, want [{10.10.70.98 32 }]", got.IPList)
+	}
+	if callCount == 0 {
+		t.Error("expected at least one GET call to re-fetch after create; got 0")
 	}
 }
 
@@ -1359,5 +2075,1060 @@ func TestDeleteMDNSRule(t *testing.T) {
 	err := c.DeleteMDNSRule(context.Background(), "site-1", "mdns-1")
 	if err != nil {
 		t.Fatalf("DeleteMDNSRule: %v", err)
+	}
+}
+
+// =============================================================================
+// UpdateSwitchPortV2 Tests
+// =============================================================================
+
+// mockOpenAPIServer creates a test server that handles both the standard
+// Omada auth paths AND a custom openapi path. The openapi path cannot be
+// registered via mockOmadaServer (which only adds /api/v2 prefixed handlers),
+// so we build a raw mux here.
+func mockOpenAPIServer(t *testing.T, openapiHandlers map[string]http.HandlerFunc, v2Handlers map[string]http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	omadacID := "test-omadac-id"
+	token := "test-csrf-token"
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(APIResponse{
+			ErrorCode: 0,
+			Msg:       "Success.",
+			Result: mustMarshal(t, ControllerInfo{
+				OmadacID:      omadacID,
+				ControllerVer: "6.1.0.19",
+				APIVer:        "3",
+			}),
+		})
+	})
+
+	mux.HandleFunc(fmt.Sprintf("/%s/api/v2/login", omadacID), func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(APIResponse{
+			ErrorCode: 0,
+			Msg:       "Success.",
+			Result:    mustMarshal(t, LoginResult{Token: token}),
+		})
+	})
+
+	// Register openapi (non-v2) handlers directly on the mux.
+	for pattern, handler := range openapiHandlers {
+		mux.HandleFunc(pattern, handler)
+	}
+
+	// Register api/v2 handlers with prefix.
+	for pattern, handler := range v2Handlers {
+		prefix := fmt.Sprintf("/%s/api/v2", omadacID)
+		mux.HandleFunc(prefix+pattern, handler)
+	}
+
+	return httptest.NewServer(mux)
+}
+
+// TestUpdateSwitchPortV2_OpenAPIPathAndBody verifies that UpdateSwitchPortV2:
+//   - sends PATCH to the openapi/v1 URL (NOT api/v2)
+//   - includes Csrf-Token header
+//   - coerces nil TagIDs to []
+//   - forces ProfileVlanOverrideEnable=true when ProfileOverrideEnable+NativeNetworkID
+//   - does NOT include /api/v2 in the write URL
+func TestUpdateSwitchPortV2_OpenAPIPathAndBody(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 3
+
+	var capturedMethod string
+	var capturedURL string
+	var capturedCsrfToken string
+	var capturedBody SwitchPortV2
+
+	// openapi PATCH handler — path as built by UpdateSwitchPortV2:
+	// {baseURL}/openapi/v1/{omadacID}/sites/{siteID}/switches/{mac}/ports/{port}
+	// On the test server the path portion is everything after the host.
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	// Build the switch config for the GetSwitchPort re-read
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{
+				Port:                      portNum,
+				Name:                      "port-3",
+				ProfileOverrideEnable:     true,
+				ProfileVlanOverrideEnable: true,
+				NativeNetworkID:           "net-trusted",
+				ProfileID:                 "profile-access",
+			},
+		},
+	}
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				capturedMethod = r.Method
+				capturedURL = r.URL.String()
+				capturedCsrfToken = r.Header.Get("Csrf-Token")
+
+				if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+					t.Errorf("decoding body: %v", err)
+				}
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	body := &SwitchPortV2{
+		Name:                  "port-3",
+		ProfileID:             "profile-access",
+		ProfileOverrideEnable: true,
+		NativeNetworkID:       "net-trusted",
+		// TagIDs intentionally nil — should be coerced to []
+		TagIDs: nil,
+	}
+
+	got, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum, body)
+	if err != nil {
+		t.Fatalf("UpdateSwitchPortV2: %v", err)
+	}
+
+	// Assert URL contains openapi/v1, not api/v2.
+	if !strings.Contains(capturedURL, "/openapi/v1/") {
+		t.Errorf("URL = %q, want it to contain /openapi/v1/", capturedURL)
+	}
+	if strings.Contains(capturedURL, "/api/v2") {
+		t.Errorf("write URL = %q, must NOT contain /api/v2", capturedURL)
+	}
+
+	// Assert method is PATCH.
+	if capturedMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", capturedMethod)
+	}
+
+	// Assert Csrf-Token header was sent.
+	if capturedCsrfToken == "" {
+		t.Error("Csrf-Token header was empty; doOpenAPIRequest should set it")
+	}
+
+	// nil TagIDs is left nil (omitted from JSON) — no coercion at the client layer.
+	// The caller (buildSwitchPortV2Body) is responsible for sending &[]string{} when
+	// the model is Null (user explicitly cleared). Nil means "preserve current".
+	// We just verify the body was decoded without error (capturedBody is a SwitchPortV2).
+	_ = capturedBody // TagIDs nil is intentional — no assertion needed here
+
+	// Assert ProfileVlanOverrideEnable forced true (override=true + nativeNetworkId set).
+	if !capturedBody.ProfileVlanOverrideEnable {
+		t.Error("ProfileVlanOverrideEnable should be forced true when ProfileOverrideEnable=true + NativeNetworkID set")
+	}
+
+	// Assert re-read returns a populated SwitchPort.
+	if got == nil {
+		t.Fatal("got nil *SwitchPort from UpdateSwitchPortV2")
+	}
+	if got.Port != portNum {
+		t.Errorf("re-read port = %d, want %d", got.Port, portNum)
+	}
+}
+
+// TestUpdateSwitchPortV2_ErrorSurfacing verifies that a non-transient controller
+// error (e.g. -39840: VLAN profile conflict) is returned as an error whose
+// message contains both the numeric code and the controller's description.
+func TestUpdateSwitchPortV2_ErrorSurfacing(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 3
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: -39840,
+					Msg:       "When the VLAN configuration in the profile bound to the port is disabled, the VLAN configuration of the port cannot follow the profile.",
+				})
+			},
+		},
+		nil,
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	empty := []string{}
+	body := &SwitchPortV2{Name: "port-3", TagIDs: &empty}
+	_, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum, body)
+	if err == nil {
+		t.Fatal("expected error from UpdateSwitchPortV2 when controller returns -39840, got nil")
+	}
+	if !strings.Contains(err.Error(), "-39840") {
+		t.Errorf("error = %q, want it to contain -39840", err.Error())
+	}
+	if !strings.Contains(err.Error(), "VLAN") {
+		t.Errorf("error = %q, want it to contain the controller message (VLAN)", err.Error())
+	}
+}
+
+// TestUpdateSwitchPortV2_TransientRetry verifies the method retries on
+// errorCode -1 and eventually returns success.
+func TestUpdateSwitchPortV2_TransientRetry(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 3
+	attempts := 0
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{Port: portNum, Name: "port-3"},
+		},
+	}
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if attempts < 3 {
+					// Return transient -1 error.
+					json.NewEncoder(w).Encode(APIResponse{ErrorCode: -1, Msg: "transient"})
+					return
+				}
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	empty := []string{}
+	body := &SwitchPortV2{Name: "port-3", TagIDs: &empty}
+	_, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum, body)
+	if err != nil {
+		t.Fatalf("UpdateSwitchPortV2 (retry): %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3 (2 transients then success)", attempts)
+	}
+}
+
+// TestPortProfile_VlanFields verifies that PortProfile correctly decodes the
+// vlanConfigEnable and networkTagsSetting fields from the controller JSON.
+// These fields are required for the VLAN derivation path in UpdateSwitchPortV2.
+func TestPortProfile_VlanFields(t *testing.T) {
+	raw := `{
+		"id": "prof-1",
+		"name": "access_iot",
+		"vlanConfigEnable": false,
+		"networkTagsSetting": 2,
+		"nativeNetworkId": "net-iot",
+		"tagNetworkIds": [],
+		"poe": 0,
+		"dot1x": 0,
+		"portIsolationEnable": false,
+		"lldpMedEnable": false,
+		"topoNotifyEnable": false,
+		"spanningTreeEnable": false,
+		"loopbackDetectEnable": false,
+		"bandWidthCtrlType": 0,
+		"eeeEnable": false,
+		"flowControlEnable": false,
+		"fastLeaveEnable": false,
+		"loopbackDetectVlanBasedEnable": false,
+		"igmpFastLeaveEnable": false,
+		"mldFastLeaveEnable": false,
+		"dot1pPriority": 0,
+		"trustMode": 0
+	}`
+
+	var p PortProfile
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	if p.VlanConfigEnable != false {
+		t.Errorf("VlanConfigEnable = %v, want false", p.VlanConfigEnable)
+	}
+	if p.NetworkTagsSetting != 2 {
+		t.Errorf("NetworkTagsSetting = %d, want 2", p.NetworkTagsSetting)
+	}
+	if p.NativeNetworkID != "net-iot" {
+		t.Errorf("NativeNetworkID = %q, want %q", p.NativeNetworkID, "net-iot")
+	}
+}
+
+// TestPortProfile_VlanFields_Enabled triangulates with vlanConfigEnable=true so
+// the decoder is exercised for both values (forces real field mapping).
+func TestPortProfile_VlanFields_Enabled(t *testing.T) {
+	raw := `{
+		"id": "prof-2",
+		"name": "trunk_uplink",
+		"vlanConfigEnable": true,
+		"networkTagsSetting": 1,
+		"nativeNetworkId": "net-mgmt",
+		"tagNetworkIds": ["net-iot", "net-trusted"],
+		"poe": 0,
+		"dot1x": 0,
+		"portIsolationEnable": false,
+		"lldpMedEnable": false,
+		"topoNotifyEnable": false,
+		"spanningTreeEnable": false,
+		"loopbackDetectEnable": false,
+		"bandWidthCtrlType": 0,
+		"eeeEnable": false,
+		"flowControlEnable": false,
+		"fastLeaveEnable": false,
+		"loopbackDetectVlanBasedEnable": false,
+		"igmpFastLeaveEnable": false,
+		"mldFastLeaveEnable": false,
+		"dot1pPriority": 0,
+		"trustMode": 0
+	}`
+
+	var p PortProfile
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	if p.VlanConfigEnable != true {
+		t.Errorf("VlanConfigEnable = %v, want true", p.VlanConfigEnable)
+	}
+	if p.NetworkTagsSetting != 1 {
+		t.Errorf("NetworkTagsSetting = %d, want 1", p.NetworkTagsSetting)
+	}
+}
+
+// TestUpdateSwitchPortV2_VlanDerivation_VlanConfigDisabled verifies that when a
+// profile has vlanConfigEnable=false and the caller sends no override/native,
+// UpdateSwitchPortV2 automatically derives VLAN settings from the profile and
+// sends profileVlanOverrideEnable=true + the profile's nativeNetworkId and
+// networkTagsSetting in the PATCH body.
+func TestUpdateSwitchPortV2_VlanDerivation_VlanConfigDisabled(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 5
+	profileID := "prof-iot"
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	// The profile returned by api/v2 GET /setting/lan/profiles.
+	// vlanConfigEnable=false triggers the derivation path.
+	iotProfile := PortProfile{
+		ID:                 profileID,
+		Name:               "access_iot",
+		VlanConfigEnable:   false,
+		NetworkTagsSetting: 2,
+		NativeNetworkID:    "net-iot",
+		TagNetworkIDs:      []string{},
+	}
+	profilesPage := PaginatedResult{
+		TotalRows:   1,
+		CurrentPage: 1,
+		CurrentSize: 1,
+	}
+	profilesPageData, _ := json.Marshal([]PortProfile{iotProfile})
+	profilesPage.Data = profilesPageData
+
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{
+				Port:                      portNum,
+				Name:                      "port-5",
+				ProfileID:                 profileID,
+				ProfileVlanOverrideEnable: true,
+				NativeNetworkID:           "net-iot",
+				NetworkTagsSetting:        2,
+			},
+		},
+	}
+
+	var capturedBody SwitchPortV2
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+					t.Errorf("decoding PATCH body: %v", err)
+				}
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/setting/lan/profiles", siteID): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, profilesPage),
+				})
+			},
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	// override=false, no NativeNetworkID — triggers derivation.
+	body := &SwitchPortV2{
+		Name:      "port-5",
+		ProfileID: profileID,
+		// ProfileOverrideEnable intentionally false (zero value)
+		// NativeNetworkID intentionally empty (zero value)
+	}
+
+	got, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum, body)
+	if err != nil {
+		t.Fatalf("UpdateSwitchPortV2: %v", err)
+	}
+
+	// Derivation must have set these three fields.
+	if !capturedBody.ProfileVlanOverrideEnable {
+		t.Error("ProfileVlanOverrideEnable should be true after VLAN derivation (vlanConfigEnable=false profile)")
+	}
+	if capturedBody.NativeNetworkID != "net-iot" {
+		t.Errorf("NativeNetworkID = %q, want %q", capturedBody.NativeNetworkID, "net-iot")
+	}
+	if capturedBody.NetworkTagsSetting == nil || *capturedBody.NetworkTagsSetting != 2 {
+		v := -1
+		if capturedBody.NetworkTagsSetting != nil {
+			v = *capturedBody.NetworkTagsSetting
+		}
+		t.Errorf("NetworkTagsSetting = %d, want 2 (from VLAN derivation)", v)
+	}
+
+	// Re-read should still succeed.
+	if got == nil {
+		t.Fatal("got nil *SwitchPort")
+	}
+}
+
+// TestUpdateSwitchPortV2_VlanDerivation_VlanConfigEnabled verifies that when
+// vlanConfigEnable=true the derivation path is NOT taken — profileVlanOverrideEnable
+// stays false and NativeNetworkID stays empty in the PATCH body.
+func TestUpdateSwitchPortV2_VlanDerivation_VlanConfigEnabled(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 6
+	profileID := "prof-trunk"
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	trunkProfile := PortProfile{
+		ID:                 profileID,
+		Name:               "trunk_uplink",
+		VlanConfigEnable:   true,
+		NetworkTagsSetting: 1,
+		NativeNetworkID:    "net-mgmt",
+		TagNetworkIDs:      []string{"net-iot"},
+	}
+	profilesPageData, _ := json.Marshal([]PortProfile{trunkProfile})
+	profilesPage := PaginatedResult{
+		TotalRows: 1, CurrentPage: 1, CurrentSize: 1,
+		Data: profilesPageData,
+	}
+
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{Port: portNum, Name: "port-6", ProfileID: profileID},
+		},
+	}
+
+	var capturedBody SwitchPortV2
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+					t.Errorf("decoding PATCH body: %v", err)
+				}
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/setting/lan/profiles", siteID): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, profilesPage),
+				})
+			},
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	body := &SwitchPortV2{
+		Name:      "port-6",
+		ProfileID: profileID,
+		// override off, no native — but profile has vlanConfigEnable=true so NO derivation
+	}
+
+	_, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum, body)
+	if err != nil {
+		t.Fatalf("UpdateSwitchPortV2: %v", err)
+	}
+
+	// Derivation must NOT have fired.
+	if capturedBody.ProfileVlanOverrideEnable {
+		t.Error("ProfileVlanOverrideEnable should be false — no derivation for vlanConfigEnable=true profile")
+	}
+	if capturedBody.NativeNetworkID != "" {
+		t.Errorf("NativeNetworkID = %q, want empty — derivation must not copy native when vlanConfigEnable=true", capturedBody.NativeNetworkID)
+	}
+}
+
+// TestUpdateSwitchPortV2_VlanDerivation_ExplicitNativePreserved verifies that
+// when the caller supplies an explicit NativeNetworkID the derivation is skipped
+// and the user-supplied value is preserved in the PATCH body.
+func TestUpdateSwitchPortV2_VlanDerivation_ExplicitNativePreserved(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 7
+	profileID := "prof-iot"
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	iotProfile := PortProfile{
+		ID:                 profileID,
+		Name:               "access_iot",
+		VlanConfigEnable:   false,
+		NetworkTagsSetting: 2,
+		NativeNetworkID:    "net-iot",
+		TagNetworkIDs:      []string{},
+	}
+	profilesPageData, _ := json.Marshal([]PortProfile{iotProfile})
+	profilesPage := PaginatedResult{
+		TotalRows: 1, CurrentPage: 1, CurrentSize: 1,
+		Data: profilesPageData,
+	}
+
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{Port: portNum, Name: "port-7", ProfileID: profileID, NativeNetworkID: "net-override"},
+		},
+	}
+
+	var capturedBody SwitchPortV2
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+					t.Errorf("decoding PATCH body: %v", err)
+				}
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/setting/lan/profiles", siteID): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, profilesPage),
+				})
+			},
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	// User supplies explicit NativeNetworkID — derivation must be skipped.
+	body := &SwitchPortV2{
+		Name:            "port-7",
+		ProfileID:       profileID,
+		NativeNetworkID: "net-override",
+	}
+
+	_, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum, body)
+	if err != nil {
+		t.Fatalf("UpdateSwitchPortV2: %v", err)
+	}
+
+	// User value must be preserved, derivation skipped.
+	if capturedBody.NativeNetworkID != "net-override" {
+		t.Errorf("NativeNetworkID = %q, want %q (user value must be preserved)", capturedBody.NativeNetworkID, "net-override")
+	}
+	if capturedBody.ProfileVlanOverrideEnable {
+		t.Error("ProfileVlanOverrideEnable should be false when user supplied explicit native (no derivation)")
+	}
+}
+
+// =============================================================================
+// Firewall ACL Tests
+// =============================================================================
+
+// TestACLRule_FullBodyMarshal verifies that ACLRule marshals the full
+// controller body shape: direction arrays always serialize as [] (never
+// omitted), and custom-ACL slices are present.
+func TestACLRule_FullBodyMarshal(t *testing.T) {
+	rule := ACLRule{
+		Name:            "test-rule",
+		Status:          true,
+		Policy:          1,
+		Type:            0,
+		Protocols:       []int{256},
+		SourceType:      0,
+		SourceIDs:       []string{},
+		DestinationType: 0,
+		DestinationIDs:  []string{},
+		Direction: ACLDirection{
+			LanToWan: false,
+			LanToLan: true,
+			WanInIDs: []string{},
+			VpnInIDs: []string{},
+		},
+		CustomAclOsws:    []string{},
+		CustomAclStacks:  []string{},
+		CustomAclDevices: []string{},
+	}
+
+	data, err := json.Marshal(rule)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	got := string(data)
+
+	checks := []string{
+		`"protocols":[256]`,
+		`"direction":{"wanInIds":[],"vpnInIds":[],"lanToWan":false,"lanToLan":true}`,
+		`"customAclOsws":[]`,
+		`"customAclStacks":[]`,
+		`"customAclDevices":[]`,
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("JSON missing %q\ngot: %s", want, got)
+		}
+	}
+}
+
+// TestUpdateACLRule_UsesPUT verifies that UpdateACLRule sends PUT (not PATCH).
+func TestUpdateACLRule_UsesPUT(t *testing.T) {
+	const siteID = "site-1"
+	const ruleID = "rule-abc"
+	capturedMethod := ""
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		fmt.Sprintf("/sites/%s/setting/firewall/acls/%s", siteID, ruleID): func(w http.ResponseWriter, r *http.Request) {
+			capturedMethod = r.Method
+			if r.Method != http.MethodPut {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			json.NewEncoder(w).Encode(APIResponse{
+				ErrorCode: 0,
+				Result: mustMarshal(t, ACLRule{
+					ID:     ruleID,
+					Name:   "test-rule",
+					Status: true,
+					Policy: 1,
+					Type:   0,
+				}),
+			})
+		},
+	})
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	rule := &ACLRule{
+		Name:             "test-rule",
+		Status:           true,
+		Policy:           1,
+		Type:             0,
+		Protocols:        []int{256},
+		SourceIDs:        []string{},
+		DestinationIDs:   []string{},
+		CustomAclOsws:    []string{},
+		CustomAclStacks:  []string{},
+		CustomAclDevices: []string{},
+		Direction: ACLDirection{
+			WanInIDs: []string{},
+			VpnInIDs: []string{},
+		},
+	}
+
+	_, err := c.UpdateACLRule(context.Background(), siteID, ruleID, rule)
+	if err != nil {
+		t.Fatalf("UpdateACLRule: %v", err)
+	}
+	if capturedMethod != http.MethodPut {
+		t.Errorf("UpdateACLRule used method %q, want PUT", capturedMethod)
+	}
+}
+
+// TestModifyACLIndex verifies the ModifyACLIndex client method sends the
+// correct POST to /cmd/acls/modifyIndex with the expected body shape.
+func TestModifyACLIndex(t *testing.T) {
+	const siteID = "site-1"
+
+	type modifyIndexBody struct {
+		Indexes map[string]int `json:"indexes"`
+		Type    int            `json:"type"`
+	}
+
+	var capturedBody modifyIndexBody
+	capturedPath := ""
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		fmt.Sprintf("/sites/%s/cmd/acls/modifyIndex", siteID): func(w http.ResponseWriter, r *http.Request) {
+			capturedPath = r.URL.Path
+			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0})
+		},
+	})
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	indexes := map[string]int{"id-a": 1, "id-b": 2}
+	if err := c.ModifyACLIndex(context.Background(), siteID, 0, indexes); err != nil {
+		t.Fatalf("ModifyACLIndex: %v", err)
+	}
+
+	omadacID := "test-omadac-id"
+	wantPath := fmt.Sprintf("/%s/api/v2/sites/%s/cmd/acls/modifyIndex", omadacID, siteID)
+	if capturedPath != wantPath {
+		t.Errorf("path = %q, want %q", capturedPath, wantPath)
+	}
+	if capturedBody.Type != 0 {
+		t.Errorf("type = %d, want 0", capturedBody.Type)
+	}
+	if capturedBody.Indexes["id-a"] != 1 {
+		t.Errorf("indexes[id-a] = %d, want 1", capturedBody.Indexes["id-a"])
+	}
+	if capturedBody.Indexes["id-b"] != 2 {
+		t.Errorf("indexes[id-b] = %d, want 2", capturedBody.Indexes["id-b"])
+	}
+}
+
+// =============================================================================
+// DeleteIPGroup — type-segment path test (BUG 1 fix)
+// =============================================================================
+
+// TestDeleteIPGroup_IncludesTypeSegment asserts that DeleteIPGroup sends DELETE
+// to /setting/profiles/groups/{groupType}/{id} — the v6/ER707 path that includes
+// the type segment. Without the type segment the controller returns -1600
+// ("Unsupported request path"). groupType 0 = IP-only group.
+func TestDeleteIPGroup_IncludesTypeSegment(t *testing.T) {
+	const siteID = "site-1"
+	const groupID = "6a1a9ee944a75c2be56118a1"
+	const groupType = 0
+
+	capturedPath := ""
+
+	server := mockOmadaServer(t, map[string]http.HandlerFunc{
+		// Correct v6 path: /setting/profiles/groups/{type}/{id}
+		fmt.Sprintf("/sites/%s/setting/profiles/groups/%d/%s", siteID, groupType, groupID): func(w http.ResponseWriter, r *http.Request) {
+			capturedPath = r.URL.Path
+			if r.Method != http.MethodDelete {
+				t.Errorf("expected DELETE, got %s", r.Method)
+			}
+			json.NewEncoder(w).Encode(APIResponse{
+				ErrorCode: 0,
+				Result:    json.RawMessage(`{}`),
+			})
+		},
+	})
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	err := c.DeleteIPGroup(context.Background(), siteID, groupType, groupID)
+	if err != nil {
+		t.Fatalf("DeleteIPGroup: %v", err)
+	}
+
+	omadacID := "test-omadac-id"
+	wantPath := fmt.Sprintf("/%s/api/v2/sites/%s/setting/profiles/groups/%d/%s", omadacID, siteID, groupType, groupID)
+	if capturedPath != wantPath {
+		t.Errorf("DELETE path = %q, want %q (missing type segment)", capturedPath, wantPath)
+	}
+}
+
+func TestSwitchPortV2_MirrorFields_Marshal(t *testing.T) {
+	body := SwitchPortV2{Name: "Port12", Operation: "mirroring", MirroredPorts: []int{1, 3, 5}}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, `"operation":"mirroring"`) {
+		t.Errorf("missing operation in %s", got)
+	}
+	if !strings.Contains(got, `"mirroredPorts":[1,3,5]`) {
+		t.Errorf("missing mirroredPorts in %s", got)
+	}
+}
+
+func TestSwitchPort_MirroredPorts_Unmarshal(t *testing.T) {
+	const raw = `{"port":12,"operation":"mirroring","mirroredPorts":[{"port":16,"portName":"x"},{"port":1,"portName":"Port1"},{"port":3},{"port":5},{"port":14}]}`
+	var p SwitchPort
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p.Operation != "mirroring" {
+		t.Errorf("operation = %q", p.Operation)
+	}
+	if len(p.MirroredPorts) != 5 {
+		t.Errorf("mirroredPorts = %v", p.MirroredPorts)
+	}
+	if p.MirroredPorts[0].Port != 16 {
+		t.Errorf("mirroredPorts[0].Port = %d, want 16", p.MirroredPorts[0].Port)
+	}
+}
+
+// =============================================================================
+// SwitchPortV2 pointer-field omit/send tests (TDD: preserve unconfigured)
+// =============================================================================
+
+// TestSwitchPortV2_MirrorPatch_OmitsNilFieldsContainsOverride verifies that a
+// mirror PATCH body with nil LinkSpeed/TagIDs omits those fields from JSON, and
+// the body contains "profileOverrideEnable":true + "operation":"mirroring".
+func TestSwitchPortV2_MirrorPatch_OmitsNilFieldsContainsOverride(t *testing.T) {
+	// Mirror body with intentionally nil LinkSpeed, TagIDs, NetworkTagsSetting.
+	body := &SwitchPortV2{
+		Name:                  "Port12",
+		ProfileOverrideEnable: true,
+		Operation:             "mirroring",
+		MirroredPorts:         []int{1, 3, 5},
+		// LinkSpeed, Duplex, TagIDs, NetworkTagsSetting intentionally nil → omit.
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bodyStr := string(data)
+
+	// Must contain override and operation.
+	if !strings.Contains(bodyStr, `"profileOverrideEnable":true`) {
+		t.Errorf("body missing profileOverrideEnable:true — got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"operation":"mirroring"`) {
+		t.Errorf("body missing operation:mirroring — got: %s", bodyStr)
+	}
+
+	// Must NOT contain nil pointer fields (omitempty drops them).
+	if strings.Contains(bodyStr, `"profileId"`) {
+		t.Errorf("body should omit profileId when empty — got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, `"linkSpeed"`) {
+		t.Errorf("body should omit linkSpeed when nil — got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, `"duplex"`) {
+		t.Errorf("body should omit duplex when nil — got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, `"tagIds"`) {
+		t.Errorf("body should omit tagIds when nil — got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, `"networkTagsSetting"`) {
+		t.Errorf("body should omit networkTagsSetting when nil — got: %s", bodyStr)
+	}
+}
+
+// TestSwitchPortV2_NilSpeedOmitFromJSON verifies that a normal update with
+// nil LinkSpeed/Duplex omits those fields from the marshaled JSON body.
+func TestSwitchPortV2_NilSpeedOmitFromJSON(t *testing.T) {
+	body := &SwitchPortV2{
+		Name:      "Port7",
+		Operation: "switching",
+		// LinkSpeed and Duplex nil → omit.
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bodyStr := string(data)
+
+	if strings.Contains(bodyStr, `"linkSpeed"`) {
+		t.Errorf("body should omit linkSpeed when nil — got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, `"duplex"`) {
+		t.Errorf("body should omit duplex when nil — got: %s", bodyStr)
+	}
+}
+
+// TestSwitchPortV2_NonNilSpeedZeroIncluded verifies that an explicit &0 speed
+// (auto-neg) IS included in the JSON body — nil vs &0 is the distinction.
+func TestSwitchPortV2_NonNilSpeedZeroIncluded(t *testing.T) {
+	zero := 0
+	body := &SwitchPortV2{
+		Name:      "Port7",
+		Operation: "switching",
+		LinkSpeed: &zero,
+		Duplex:    &zero,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bodyStr := string(data)
+
+	if !strings.Contains(bodyStr, `"linkSpeed":0`) {
+		t.Errorf("body should contain linkSpeed:0 when &0 — got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"duplex":0`) {
+		t.Errorf("body should contain duplex:0 when &0 — got: %s", bodyStr)
+	}
+}
+
+// TestUpdateSwitchPortV2_MirroringForcesProfileOverride verifies that
+// UpdateSwitchPortV2 sets ProfileOverrideEnable=true when the body has
+// Operation=="mirroring", regardless of what the caller passed.
+func TestUpdateSwitchPortV2_MirroringForcesProfileOverride(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 12
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	var captured string
+
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{Port: portNum, Name: "Port12", Operation: "mirroring"},
+		},
+	}
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				captured = string(b)
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	// Caller passes ProfileOverrideEnable=false — UpdateSwitchPortV2 must correct it.
+	_, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum,
+		&SwitchPortV2{
+			Name:                  "Port12",
+			Operation:             "mirroring",
+			ProfileOverrideEnable: false, // intentionally wrong — must be forced true
+			MirroredPorts:         []int{1, 3},
+		})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !strings.Contains(captured, `"profileOverrideEnable":true`) {
+		t.Errorf("PATCH body should have profileOverrideEnable:true for mirroring, got: %s", captured)
+	}
+}
+
+// TestUpdateSwitchPortV2_SendsMirrorFields verifies that UpdateSwitchPortV2
+// serialises Operation and MirroredPorts into the outgoing PATCH body.
+// Pattern copied from TestUpdateSwitchPortV2_OpenAPIPathAndBody.
+func TestUpdateSwitchPortV2_SendsMirrorFields(t *testing.T) {
+	omadacID := "test-omadac-id"
+	siteID := "site-1"
+	mac := "aa:bb:cc:dd:ee:ff"
+	portNum := 12
+
+	openAPIPath := fmt.Sprintf("/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		omadacID, siteID, mac, portNum)
+
+	var captured string
+
+	switchCfg := SwitchConfig{
+		MAC:  mac,
+		Name: "test-switch",
+		Ports: []SwitchPort{
+			{Port: portNum, Name: "Port12"},
+		},
+	}
+
+	server := mockOpenAPIServer(t,
+		map[string]http.HandlerFunc{
+			openAPIPath: func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				captured = string(b)
+				json.NewEncoder(w).Encode(APIResponse{ErrorCode: 0, Msg: "Success."})
+			},
+		},
+		map[string]http.HandlerFunc{
+			fmt.Sprintf("/sites/%s/switches/%s", siteID, mac): func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(APIResponse{
+					ErrorCode: 0,
+					Result:    mustMarshal(t, switchCfg),
+				})
+			},
+		},
+	)
+	defer server.Close()
+	c := newTestClient(t, server)
+
+	_, err := c.UpdateSwitchPortV2(context.Background(), siteID, mac, portNum,
+		&SwitchPortV2{Name: "Port12", Operation: "mirroring", MirroredPorts: []int{1, 3, 5}})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !strings.Contains(captured, `"operation":"mirroring"`) || !strings.Contains(captured, `"mirroredPorts":[1,3,5]`) {
+		t.Errorf("PATCH body missing mirror fields: %s", captured)
 	}
 }

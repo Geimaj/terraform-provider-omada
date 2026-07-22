@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
 )
 
 var _ datasource.DataSource = &NetworksDataSource{}
@@ -93,7 +93,8 @@ func (d *NetworksDataSource) Read(ctx context.Context, req datasource.ReadReques
 	}
 
 	state := NetworksDataSourceModel{
-		SiteID: config.SiteID,
+		SiteID:   config.SiteID,
+		Networks: []NetworkDataModel{},
 	}
 	for _, n := range networks {
 		dm := NetworkDataModel{
@@ -218,8 +219,9 @@ func (d *WirelessNetworksDataSource) Read(ctx context.Context, req datasource.Re
 	}
 
 	state := WirelessNetworksDataSourceModel{
-		SiteID:      config.SiteID,
-		WlanGroupID: types.StringValue(wlanGroupID),
+		SiteID:           config.SiteID,
+		WlanGroupID:      types.StringValue(wlanGroupID),
+		WirelessNetworks: []WirelessNetworkDataModel{},
 	}
 	for _, s := range ssids {
 		dm := WirelessNetworkDataModel{
@@ -331,7 +333,8 @@ func (d *PortProfilesDataSource) Read(ctx context.Context, req datasource.ReadRe
 	}
 
 	state := PortProfilesDataSourceModel{
-		SiteID: config.SiteID,
+		SiteID:       config.SiteID,
+		PortProfiles: []PortProfileDataModel{},
 	}
 	for _, p := range profiles {
 		tagIDs, diags := types.ListValueFrom(ctx, types.StringType, p.TagNetworkIDs)
@@ -418,7 +421,9 @@ func (d *SitesDataSource) Read(ctx context.Context, req datasource.ReadRequest, 
 		return
 	}
 
-	var state SitesDataSourceModel
+	state := SitesDataSourceModel{
+		Sites: []SiteDataModel{},
+	}
 	for _, s := range sites {
 		state.Sites = append(state.Sites, SiteDataModel{
 			ID:   types.StringValue(s.ID),
@@ -732,7 +737,8 @@ func (d *DevicesDataSource) Read(ctx context.Context, req datasource.ReadRequest
 	}
 
 	state := DevicesDataSourceModel{
-		SiteID: config.SiteID,
+		SiteID:  config.SiteID,
+		Devices: []DeviceDataModel{},
 	}
 	for _, dev := range devices {
 		state.Devices = append(state.Devices, DeviceDataModel{
@@ -1163,6 +1169,123 @@ func (d *MDNSReflectorsDataSource) Read(ctx context.Context, req datasource.Read
 			ProfileIDs:      profileIDs,
 			ServiceNetworks: serviceNetworks,
 			ClientNetworks:  clientNetworks,
+		})
+	}
+
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// ============================================================================
+// Gateway Ports Data Source
+// ============================================================================
+
+var _ datasource.DataSource = &GatewayPortsDataSource{}
+
+type GatewayPortsDataSource struct {
+	client *client.Client
+}
+
+type GatewayPortsDataSourceModel struct {
+	SiteID types.String           `tfsdk:"site_id"`
+	Ports  []GatewayPortDataModel `tfsdk:"ports"`
+}
+
+type GatewayPortDataModel struct {
+	ID              types.String `tfsdk:"id"`
+	Name            types.String `tfsdk:"name"`
+	Type            types.Int64  `tfsdk:"type"`
+	Mode            types.Int64  `tfsdk:"mode"`
+	LanNetworkNames types.List   `tfsdk:"lan_network_names"`
+}
+
+func NewGatewayPortsDataSource() datasource.DataSource {
+	return &GatewayPortsDataSource{}
+}
+
+func (d *GatewayPortsDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_gateway_ports"
+}
+
+func (d *GatewayPortsDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Description: "Lists the WAN/LAN ports configurable on the site's gateway. Each port has a stable UUID (`id` attribute) that can be passed to `omada_network`'s `lan_interface_ids` field to bind a network to that port. Returns the controller's port template even when no gateway has been adopted yet.",
+		Attributes: map[string]schema.Attribute{
+			"site_id": siteIDDataSourceSchema(),
+			"ports": schema.ListNestedAttribute{
+				Description: "List of gateway WAN/LAN ports.",
+				Computed:    true,
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"id": schema.StringAttribute{
+							Description: "Port UUID. Pass this value to `omada_network.lan_interface_ids` to bind a network to this port.",
+							Computed:    true,
+						},
+						"name": schema.StringAttribute{
+							Description: "Human-readable port name (e.g., 'WAN', 'WAN/LAN1', 'LAN1').",
+							Computed:    true,
+						},
+						"type": schema.Int64Attribute{
+							Description: "Port type. 0 = WAN-only, 1 = WAN/LAN dual-purpose.",
+							Computed:    true,
+						},
+						"mode": schema.Int64Attribute{
+							Description: "Current port mode. 0 = WAN, 1 = LAN.",
+							Computed:    true,
+						},
+						"lan_network_names": schema.ListAttribute{
+							Description: "Names of networks currently bound to this port.",
+							Computed:    true,
+							ElementType: types.StringType,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (d *GatewayPortsDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+	c, ok := req.ProviderData.(*client.Client)
+	if !ok {
+		resp.Diagnostics.AddError("Unexpected Provider Data", "expected *client.Client")
+		return
+	}
+	d.client = c
+}
+
+func (d *GatewayPortsDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+	var config GatewayPortsDataSourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	siteID := config.SiteID.ValueString()
+	ports, err := d.client.ListGatewayPorts(ctx, siteID)
+	if err != nil {
+		resp.Diagnostics.AddError("Error listing gateway ports", err.Error())
+		return
+	}
+
+	state := GatewayPortsDataSourceModel{
+		SiteID: config.SiteID,
+		Ports:  []GatewayPortDataModel{},
+	}
+	for _, p := range ports {
+		names, diags := types.ListValueFrom(ctx, types.StringType, p.LanNetworkNames)
+		resp.Diagnostics.Append(diags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		state.Ports = append(state.Ports, GatewayPortDataModel{
+			ID:              types.StringValue(p.PortUUID),
+			Name:            types.StringValue(p.PortName),
+			Type:            types.Int64Value(int64(p.Type)),
+			Mode:            types.Int64Value(int64(p.Mode)),
+			LanNetworkNames: names,
 		})
 	}
 

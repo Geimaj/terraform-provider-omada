@@ -2,9 +2,11 @@ package resources
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
+	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
@@ -12,7 +14,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/Daily-Nerd/terraform-provider-omada/internal/client"
 )
 
 var _ resource.Resource = &ACLRuleResource{}
@@ -38,6 +39,7 @@ type ACLRuleResourceModel struct {
 	DestinationIDs  types.List   `tfsdk:"destination_ids"`
 	LanToWan        types.Bool   `tfsdk:"lan_to_wan"`
 	LanToLan        types.Bool   `tfsdk:"lan_to_lan"`
+	WanInIDs        types.List   `tfsdk:"wan_in_ids"`
 	BiDirectional   types.Bool   `tfsdk:"bi_directional"`
 	Index           types.Int64  `tfsdk:"index"`
 }
@@ -88,7 +90,7 @@ func (r *ACLRuleResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				ElementType: types.Int64Type,
 			},
 			"source_type": schema.Int64Attribute{
-				Description: "Source type: 0=network, 2=ip_group.",
+				Description: "Source type: 0=network, 1=ip_group.",
 				Optional:    true,
 				Computed:    true,
 				Default:     int64default.StaticInt64(0),
@@ -99,7 +101,7 @@ func (r *ACLRuleResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				ElementType: types.StringType,
 			},
 			"destination_type": schema.Int64Attribute{
-				Description: "Destination type: 0=network, 2=ip_group.",
+				Description: "Destination type: 0=network, 1=ip_group.",
 				Optional:    true,
 				Computed:    true,
 				Default:     int64default.StaticInt64(0),
@@ -120,6 +122,12 @@ func (r *ACLRuleResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(true),
+			},
+			"wan_in_ids": schema.ListAttribute{
+				Description: "WAN interface UUIDs for LAN-to-WAN direction (from omada_gateway_ports data source). Required by the controller when lan_to_wan is true.",
+				Optional:    true,
+				Computed:    true,
+				ElementType: types.StringType,
 			},
 			"bi_directional": schema.BoolAttribute{
 				Description: "Whether this rule applies in both directions.",
@@ -150,34 +158,72 @@ func (r *ACLRuleResource) Configure(_ context.Context, req resource.ConfigureReq
 	r.client = c
 }
 
-func (r *ACLRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var plan ACLRuleResourceModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	if resp.Diagnostics.HasError() {
-		return
+// validateWanInNetworkSource guards against the Omada API constraint that
+// forbids a Network source (source_type=0) on a LAN→WAN rule. The controller
+// rejects this combination with error code -33792:
+//
+//	"If the ACL direction is set to WAN IN, then the source cannot select
+//	 SSID, Network or ! Network."
+//
+// For internet-bound rules (lan_to_wan=true) the source must be an IP group
+// (source_type=1). This function returns a descriptive error so the plan can
+// surface the problem before the apply-time API rejection.
+// LAN-to-LAN rules are unaffected — source_type=0 is valid and common there.
+func validateWanInNetworkSource(plan *ACLRuleResourceModel) error {
+	if plan.LanToWan.ValueBool() && plan.SourceType.ValueInt64() == 0 {
+		return errors.New(
+			"Omada rejects a Network source on a LAN→WAN rule (-33792): " +
+				"\"If the ACL direction is set to WAN IN, then the source cannot select SSID, Network or ! Network.\" " +
+				"Use an ip_group source (source_type=1) for internet-bound rules.",
+		)
 	}
+	return nil
+}
 
-	siteID := plan.SiteID.ValueString()
-
+// buildACLRuleFromPlan constructs a client.ACLRule from the resource plan.
+// Empty custom-ACL slices (customAclOsws/Stacks/Devices) and direction arrays
+// (wanInIds/vpnInIds) are always initialized to []string{} so they serialize
+// as [] rather than null, satisfying the controller's schema validation.
+// Errors are appended to errs; callers must check before using the result.
+func buildACLRuleFromPlan(ctx context.Context, plan *ACLRuleResourceModel, errs *[]error) *client.ACLRule {
 	var protocols []int
-	resp.Diagnostics.Append(plan.Protocols.ElementsAs(ctx, &protocols, false)...)
-	if resp.Diagnostics.HasError() {
-		return
+	if diags := plan.Protocols.ElementsAs(ctx, &protocols, false); diags.HasError() {
+		for _, d := range diags {
+			*errs = append(*errs, fmt.Errorf("%s: %s", d.Summary(), d.Detail()))
+		}
+		return nil
 	}
 
 	var sourceIDs []string
-	resp.Diagnostics.Append(plan.SourceIDs.ElementsAs(ctx, &sourceIDs, false)...)
-	if resp.Diagnostics.HasError() {
-		return
+	if diags := plan.SourceIDs.ElementsAs(ctx, &sourceIDs, false); diags.HasError() {
+		for _, d := range diags {
+			*errs = append(*errs, fmt.Errorf("%s: %s", d.Summary(), d.Detail()))
+		}
+		return nil
 	}
 
 	var destIDs []string
-	resp.Diagnostics.Append(plan.DestinationIDs.ElementsAs(ctx, &destIDs, false)...)
-	if resp.Diagnostics.HasError() {
-		return
+	if diags := plan.DestinationIDs.ElementsAs(ctx, &destIDs, false); diags.HasError() {
+		for _, d := range diags {
+			*errs = append(*errs, fmt.Errorf("%s: %s", d.Summary(), d.Detail()))
+		}
+		return nil
 	}
 
-	rule := &client.ACLRule{
+	var wanInIDs []string
+	if !plan.WanInIDs.IsNull() && !plan.WanInIDs.IsUnknown() {
+		if diags := plan.WanInIDs.ElementsAs(ctx, &wanInIDs, false); diags.HasError() {
+			for _, d := range diags {
+				*errs = append(*errs, fmt.Errorf("%s: %s", d.Summary(), d.Detail()))
+			}
+			return nil
+		}
+	}
+	if wanInIDs == nil {
+		wanInIDs = []string{}
+	}
+
+	return &client.ACLRule{
 		Name:            plan.Name.ValueString(),
 		Type:            int(plan.Type.ValueInt64()),
 		Status:          plan.Status.ValueBool(),
@@ -191,7 +237,38 @@ func (r *ACLRuleResource) Create(ctx context.Context, req resource.CreateRequest
 		Direction: client.ACLDirection{
 			LanToWan: plan.LanToWan.ValueBool(),
 			LanToLan: plan.LanToLan.ValueBool(),
+			WanInIDs: wanInIDs,
+			VpnInIDs: []string{},
 		},
+		CustomAclOsws:    []string{},
+		CustomAclStacks:  []string{},
+		CustomAclDevices: []string{},
+	}
+}
+
+func (r *ACLRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var plan ACLRuleResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Plan-time guard: Omada rejects Network sources on LAN→WAN rules (-33792).
+	// Surface this as a clear diagnostic before hitting the API.
+	if err := validateWanInNetworkSource(&plan); err != nil {
+		resp.Diagnostics.AddError("Invalid ACL rule configuration", err.Error())
+		return
+	}
+
+	siteID := plan.SiteID.ValueString()
+
+	var errs []error
+	rule := buildACLRuleFromPlan(ctx, &plan, &errs)
+	for _, e := range errs {
+		resp.Diagnostics.AddError("Error building ACL rule", e.Error())
+	}
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
 	created, err := r.client.CreateACLRule(ctx, siteID, rule)
@@ -239,39 +316,13 @@ func (r *ACLRuleResource) Update(ctx context.Context, req resource.UpdateRequest
 
 	siteID := state.SiteID.ValueString()
 
-	var protocols []int
-	resp.Diagnostics.Append(plan.Protocols.ElementsAs(ctx, &protocols, false)...)
+	var errs []error
+	rule := buildACLRuleFromPlan(ctx, &plan, &errs)
+	for _, e := range errs {
+		resp.Diagnostics.AddError("Error building ACL rule", e.Error())
+	}
 	if resp.Diagnostics.HasError() {
 		return
-	}
-
-	var sourceIDs []string
-	resp.Diagnostics.Append(plan.SourceIDs.ElementsAs(ctx, &sourceIDs, false)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	var destIDs []string
-	resp.Diagnostics.Append(plan.DestinationIDs.ElementsAs(ctx, &destIDs, false)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	rule := &client.ACLRule{
-		Name:            plan.Name.ValueString(),
-		Type:            int(plan.Type.ValueInt64()),
-		Status:          plan.Status.ValueBool(),
-		Policy:          int(plan.Policy.ValueInt64()),
-		Protocols:       protocols,
-		SourceType:      int(plan.SourceType.ValueInt64()),
-		SourceIDs:       sourceIDs,
-		DestinationType: int(plan.DestinationType.ValueInt64()),
-		DestinationIDs:  destIDs,
-		BiDirectional:   plan.BiDirectional.ValueBool(),
-		Direction: client.ACLDirection{
-			LanToWan: plan.LanToWan.ValueBool(),
-			LanToLan: plan.LanToLan.ValueBool(),
-		},
 	}
 
 	updated, err := r.client.UpdateACLRule(ctx, siteID, state.ID.ValueString(), rule)
@@ -365,4 +416,7 @@ func (r *ACLRuleResource) setStateFromAPI(ctx context.Context, model *ACLRuleRes
 
 	destIDs, _ := types.ListValueFrom(ctx, types.StringType, rule.DestinationIDs)
 	model.DestinationIDs = destIDs
+
+	wanInIDs, _ := types.ListValueFrom(ctx, types.StringType, rule.Direction.WanInIDs)
+	model.WanInIDs = wanInIDs
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
@@ -16,6 +17,16 @@ import (
 )
 
 // Client is the Omada Controller API client.
+//
+// Two mutexes are used intentionally:
+//   - mu serializes the auth bootstrap (controller info + login) inside
+//     ensureAuth so concurrent callers don't all log in at once.
+//   - createMu serializes the openapi/v1 network create POST. The controller
+//     serializes gateway-device provisioning server-side and does NOT queue;
+//     when more than ~5 concurrent /networks/confirm requests land it returns
+//     "API error -1: General error" on the overflow. Holding a separate mutex
+//     here (instead of reusing c.mu) avoids a deadlock against ensureAuth,
+//     which is called from inside CreateInterfaceNetwork and also takes c.mu.
 type Client struct {
 	baseURL    string
 	username   string
@@ -24,11 +35,18 @@ type Client struct {
 	token      string
 	httpClient *http.Client
 	mu         sync.Mutex
+	createMu   sync.Mutex
 	readOnly   bool
 }
 
 // ErrReadOnly is returned when a write operation is attempted in read-only mode.
 var ErrReadOnly = fmt.Errorf("operation blocked: provider is in read_only mode — only data sources and imports are allowed")
+
+// ErrNotFound is returned when a requested resource does not exist on the
+// controller. Callers (resource Read methods) should check errors.Is(err,
+// ErrNotFound) and call resp.State.RemoveResource(ctx) to model drift
+// gracefully instead of surfacing a hard error.
+var ErrNotFound = fmt.Errorf("not found")
 
 // APIResponse is the standard response envelope from the Omada API.
 type APIResponse struct {
@@ -103,12 +121,55 @@ type SiteSettingFields struct {
 	Scenario string `json:"scenario,omitempty"`
 }
 
+// DhcpIPRange is a single start/end pair inside a multi-range DHCP pool.
+type DhcpIPRange struct {
+	IPAddrStart string `json:"ipaddrStart"`
+	IPAddrEnd   string `json:"ipaddrEnd"`
+}
+
 // DHCPSettings holds DHCP server configuration for a network.
 type DHCPSettings struct {
 	Enable      bool   `json:"enable"`
 	IPAddrStart string `json:"ipaddrStart,omitempty"`
 	IPAddrEnd   string `json:"ipaddrEnd,omitempty"`
 	LeaseTime   int    `json:"leasetime,omitempty"`
+	// Dhcpns is the DNS source: "auto" (use gateway DNS) or "manual"
+	// (use PriDns / SecondaryDns fields). Optional — controller defaults
+	// to "auto". The legacy /api/v2 list endpoint returns the same
+	// openapi/v1 wire format here ("dhcpns", "priDns", "secondaryDns").
+	Dhcpns string `json:"dhcpns,omitempty"`
+	// PriDns / SecondaryDns are the per-network DNS servers handed out as
+	// DHCP option 6 when Dhcpns == "manual". Empty strings are stripped via
+	// omitempty so the controller falls back to gateway DNS in "auto" mode.
+	// Previous field names (Dhcpns1/Dhcpns2 with tags dhcpns1/dhcpns2) were
+	// wrong — the controller's /api/v2 GET emits openapi/v1-style tags, so
+	// the old names silently dropped priDns on Read after Update.
+	PriDns       string `json:"priDns,omitempty"`
+	SecondaryDns string `json:"secondaryDns,omitempty"`
+	// IPRangePool enables multiple IP range pools per DHCP scope. Mutually
+	// exclusive with the single IPAddrStart/IPAddrEnd pair on some
+	// firmware versions; consult controller behavior before mixing.
+	IPRangePool []DhcpIPRange `json:"ipRangePool,omitempty"`
+	// IPRangeStart / IPRangeEnd are the uint32-encoded form the controller
+	// computes and echoes back from /api/v2 GET. Captured for the
+	// read-merge path so /openapi/v1/.../networks/{id}/check sees the
+	// fields it already knows about. omitempty so legacy POST/PATCH
+	// bodies (which never set them) do not start sending zeros and
+	// thereby invalidate the pool.
+	IPRangeStart int64 `json:"ipRangeStart,omitempty"`
+	IPRangeEnd   int64 `json:"ipRangeEnd,omitempty"`
+	// GatewayMode is the DHCP gateway mode the openapi/v1 endpoint expects
+	// in the echoed-back body ("auto" on standard LANs). Captured here so
+	// the read-merge can carry it through; legacy /api/v2 may omit it.
+	GatewayMode string `json:"gatewayMode,omitempty"`
+	// Options is the controller's custom DHCP option array. Captured to
+	// preserve it through the read-merge — provider does not model it yet.
+	Options []interface{} `json:"options,omitempty"`
+}
+
+// DhcpGuardSettings holds DHCP guard toggles (DHCPv4 or DHCPv6).
+type DhcpGuardSettings struct {
+	Enable bool `json:"enable"`
 }
 
 // Network represents a LAN network / VLAN configuration.
@@ -121,6 +182,61 @@ type Network struct {
 	DHCPSettings    *DHCPSettings `json:"dhcpSettings,omitempty"`
 	Isolation       bool          `json:"isolation"`
 	IGMPSnoopEnable bool          `json:"igmpSnoopEnable"`
+
+	// InterfaceIds binds the network to one or more gateway LAN interfaces.
+	// Required by the controller for purpose=interface networks once a
+	// gateway is adopted; absence triggers API error -33515.
+	InterfaceIds []string `json:"interfaceIds,omitempty"`
+
+	// Application is the network application type (controller-internal
+	// classification, e.g. 0=lan, 1=guest). Defaults to 0 — change with
+	// caution.
+	Application int `json:"application"`
+	// VlanType is the VLAN type variant: 0=standard, others reserved for
+	// voice / IPTV / etc.
+	VlanType int `json:"vlanType"`
+
+	// FastLeaveEnable enables IGMP fast-leave on this network. Distinct
+	// from the port_profile field of the same name — this is L3 / network-
+	// scoped, the port_profile field is L2 / port-scoped.
+	FastLeaveEnable bool `json:"fastLeaveEnable"`
+	// MldSnoopEnable enables MLD snooping (IPv6 multicast) on this network.
+	MldSnoopEnable bool `json:"mldSnoopEnable"`
+
+	// DHCP guard nested toggles. Both unconditionally serialized so the
+	// controller never sees a missing key.
+	DhcpV6Guard       *DhcpGuardSettings `json:"dhcpv6Guard,omitempty"`
+	DhcpGuard         *DhcpGuardSettings `json:"dhcpGuard,omitempty"`
+	DhcpL2RelayEnable bool               `json:"dhcpL2RelayEnable"`
+
+	// Feature toggles
+	Portal             bool `json:"portal"`
+	AccessControlRule  bool `json:"accessControlRule"`
+	RateLimit          bool `json:"rateLimit"`
+	ArpDetectionEnable bool `json:"arpDetectionEnable"`
+
+	// Gateway binding — surfaced from the /api/v2 GET so the read-merge in
+	// UpdateInterfaceNetwork can echo them back to the openapi/v1 /check
+	// endpoint, which rejects the body with "-1001: must not be null" if
+	// any field it knows about is absent.
+	DeviceMac  string `json:"deviceMac,omitempty"`
+	DeviceType int    `json:"deviceType,omitempty"`
+
+	// Misc per-network toggles populated by /api/v2 GET. Captured for
+	// read-merge fidelity; provider does not model them as inputs yet.
+	UpnpLanEnable  bool `json:"upnpLanEnable"`
+	QosQueueEnable bool `json:"qosQueueEnable"`
+	ExistMultiVlan bool `json:"existMultiVlan"`
+
+	// LanNetworkIPv6Config is the IPv6 settings block. Pointer so we can
+	// distinguish controller-supplied (present) from absent.
+	LanNetworkIPv6Config *LanNetworkIPv6Config `json:"lanNetworkIpv6Config,omitempty"`
+
+	// Computed read-back fields the openapi/v1 /check endpoint expects
+	// echoed back verbatim. The controller derives them from the network's
+	// IP plan; sending zeros — or omitting them — triggers -1001.
+	TotalIpNum    int `json:"totalIpNum,omitempty"`
+	DhcpServerNum int `json:"dhcpServerNum,omitempty"`
 }
 
 // WlanGroup represents a wireless LAN group.
@@ -227,8 +343,15 @@ type MultiCastSetting struct {
 
 // PortProfile represents a switch port profile.
 type PortProfile struct {
-	ID                            string               `json:"id,omitempty"`
-	Name                          string               `json:"name"`
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name"`
+	// VlanConfigEnable is false when the controller manages VLAN via the new
+	// UI (openapi surface). When false, UpdateSwitchPortV2 must derive VLAN
+	// settings from the profile rather than relying on the controller default.
+	VlanConfigEnable bool `json:"vlanConfigEnable"`
+	// NetworkTagsSetting mirrors the openapi field of the same name.
+	// 2 = untagged-from-native; used with NativeNetworkID by the controller.
+	NetworkTagsSetting            int                  `json:"networkTagsSetting"`
 	NativeNetworkID               string               `json:"nativeNetworkId,omitempty"`
 	TagNetworkIDs                 []string             `json:"tagNetworkIds"`
 	UntagNetworkIDs               []string             `json:"untagNetworkIds,omitempty"`
@@ -274,6 +397,78 @@ type DhcpL2RelaySettings struct {
 	Enable bool `json:"enable"`
 }
 
+// PortProfileV2 is the body shape the v6 controller expects on
+// PATCH /openapi/v2/{omadacId}/sites/{siteId}/lan-profiles/{id}.
+//
+// Modelled byte-for-byte from the live UI capture saved at
+// dist/probe-openapi-v2-port-profile/00-patch.body.json. The legacy
+// /api/v2/setting/lan/profiles/{id} PATCH path returns errorCode -33854
+// ("The VLAN configuration for this profile has been disabled in the
+// new UI") once the controller marks a profile as managed by the v6 UI.
+// The openapi/v2 path is the only way to mutate tagNetworkIds /
+// untagNetworkIds / nativeNetworkId on those profiles.
+//
+// IMPORTANT: vlanConfigEnable MUST be true on every PATCH. The -33854
+// error literally means the controller has flipped vlanConfigEnable to
+// false; setting it back to true is the unlock that lets VLAN edits land.
+//
+// Fields without omitempty are intentional — the controller is strict
+// about a complete body. Send the full read-back overlaid with the
+// caller's three TF-controlled fields (tag/untag/native).
+type PortProfileV2 struct {
+	ID                            string                    `json:"id"`
+	Name                          string                    `json:"name"`
+	POE                           int                       `json:"poe"`
+	Dot1x                         int                       `json:"dot1x"`
+	PortIsolationEnable           bool                      `json:"portIsolationEnable"`
+	SpanningTreeEnable            bool                      `json:"spanningTreeEnable"`
+	LoopbackDetectVlanBasedEnable bool                      `json:"loopbackDetectVlanBasedEnable"`
+	LldpMedEnable                 bool                      `json:"lldpMedEnable"`
+	FlowControlEnable             bool                      `json:"flowControlEnable"`
+	EeeEnable                     bool                      `json:"eeeEnable"`
+	IgmpFastLeaveEnable           bool                      `json:"igmpFastLeaveEnable"`
+	MldFastLeaveEnable            bool                      `json:"mldFastLeaveEnable"`
+	FastLeaveEnable               bool                      `json:"fastLeaveEnable"`
+	SupportESEnable               bool                      `json:"supportESEnable"`
+	BandWidthCtrlType             int                       `json:"bandWidthCtrlType"`
+	VlanConfigEnable              bool                      `json:"vlanConfigEnable"` // MUST be true; unlocks -33854
+	NativeNetworkID               string                    `json:"nativeNetworkId"`
+	UntagNetworkIDs               []string                  `json:"untagNetworkIds"`
+	TagNetworkIDs                 []string                  `json:"tagNetworkIds"`
+	ESEnableTaggedNetworkIDs      []string                  `json:"esEnableTaggedNetworkIds"`
+	NetworkTagsSetting            int                       `json:"networkTagsSetting"`
+	VoiceNetworkEnable            bool                      `json:"voiceNetworkEnable"`
+	VoiceDscpEnable               bool                      `json:"voiceDscpEnable"`
+	InstanceEnable                bool                      `json:"instanceEnable"`
+	Instances                     []interface{}             `json:"instances"`
+	Flag                          int                       `json:"flag"`
+	ProhibitModify                bool                      `json:"prohibitModify"`
+	TopoNotifyEnable              bool                      `json:"topoNotifyEnable"`
+	LoopbackDetectEnable          bool                      `json:"loopbackDetectEnable"`
+	Type                          int                       `json:"type"`
+	Resource                      int                       `json:"resource"`
+	DhcpL2RelaySettings           DhcpGuardSettings         `json:"dhcpL2RelaySettings"`
+	SpanningTreeSetting           PortProfileSpanningTreeV2 `json:"spanningTreeSetting"`
+}
+
+// PortProfileSpanningTreeV2 is the openapi/v2 STP block. Differs from the
+// legacy SpanningTreeSetting: the v2 body does NOT include mcheck and
+// adds instanceEnable.
+type PortProfileSpanningTreeV2 struct {
+	Priority       int  `json:"priority"`
+	ExtPathCost    int  `json:"extPathCost"`
+	IntPathCost    int  `json:"intPathCost"`
+	EdgePort       bool `json:"edgePort"`
+	P2pLink        int  `json:"p2pLink"`
+	LoopProtect    bool `json:"loopProtect"`
+	RootProtect    bool `json:"rootProtect"`
+	TcGuard        bool `json:"tcGuard"`
+	BpduProtect    bool `json:"bpduProtect"`
+	BpduFilter     bool `json:"bpduFilter"`
+	BpduForward    bool `json:"bpduForward"`
+	InstanceEnable bool `json:"instanceEnable"`
+}
+
 // NewClient creates a new Omada API client.
 func NewClient(baseURL, username, password string, skipTLSVerify bool) (*Client, error) {
 	jar, err := cookiejar.New(nil)
@@ -303,15 +498,14 @@ func NewClient(baseURL, username, password string, skipTLSVerify bool) (*Client,
 		httpClient: httpClient,
 	}
 
-	// Step 1: Get controller ID
-	if err := c.getControllerInfo(context.Background()); err != nil {
-		return nil, fmt.Errorf("getting controller info: %w", err)
-	}
-
-	// Step 2: Login
-	if err := c.login(context.Background()); err != nil {
-		return nil, fmt.Errorf("logging in: %w", err)
-	}
+	// Authentication is deferred until the first API request. NewClient only
+	// validates basic structural inputs (cookie jar, transport, URL trim).
+	// The controller info + login round-trip happens inside ensureAuth, gated
+	// by the first call to doSiteRequest / doGlobalRequest.
+	//
+	// This lets terraform plan / validate succeed against configs whose
+	// resources resolve to count=0 or empty for_each without requiring live
+	// controller credentials.
 
 	return c, nil
 }
@@ -376,13 +570,21 @@ func (c *Client) login(ctx context.Context) error {
 	return nil
 }
 
-// ensureAuth re-authenticates if the session has expired.
+// ensureAuth lazily authenticates with the controller. It is safe to call
+// multiple times — subsequent calls become no-ops once omadacID and token are
+// populated. Called at the top of every site-scoped and global-scoped request
+// helper to keep authentication deferred until first real use.
 func (c *Client) ensureAuth(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.omadacID == "" {
+		if err := c.getControllerInfo(ctx); err != nil {
+			return fmt.Errorf("getting controller info: %w", err)
+		}
+	}
 	if c.token == "" {
 		if err := c.login(ctx); err != nil {
-			return err
+			return fmt.Errorf("logging in: %w", err)
 		}
 	}
 	return nil
@@ -407,15 +609,36 @@ func (c *Client) siteURL(siteID, path string) string {
 	return fmt.Sprintf("%s/%s/api/v2/sites/%s%s?token=%s", c.baseURL, c.omadacID, siteID, path, c.token)
 }
 
-// doSiteRequest performs a site-scoped API request.
+// doSiteRequest performs a site-scoped API request. Lazily authenticates on
+// first call.
 func (c *Client) doSiteRequest(ctx context.Context, siteID, method, path string, body interface{}) (*APIResponse, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
 	url := c.siteURL(siteID, path)
 	return c.doRequest(ctx, method, url, body)
 }
 
-// doSiteRequestWithParams is like doSiteRequest but appends extra query params.
+// doSiteRequestWithParams is like doSiteRequest but appends extra query
+// params. Lazily authenticates on first call.
 func (c *Client) doSiteRequestWithParams(ctx context.Context, siteID, method, path, extraParams string, body interface{}) (*APIResponse, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
 	url := c.siteURL(siteID, path) + extraParams
+	return c.doRequest(ctx, method, url, body)
+}
+
+// doGlobalRequest performs a non-site-scoped API request (e.g., /sites,
+// /idps, /extendUserGroups). Lazily authenticates on first call. Use this
+// instead of building a URL with c.globalURL() and calling c.doRequest()
+// directly — the latter pattern bypasses lazy auth and will see empty token
+// on first invocation.
+func (c *Client) doGlobalRequest(ctx context.Context, method, path, extraParams string, body interface{}) (*APIResponse, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
+	url := c.globalURL(path) + extraParams
 	return c.doRequest(ctx, method, url, body)
 }
 
@@ -527,8 +750,7 @@ func (c *Client) ResolveSiteID(ctx context.Context, nameOrID string) (string, er
 
 // ListSites returns all sites from the controller.
 func (c *Client) ListSites(ctx context.Context) ([]Site, error) {
-	url := c.globalURL("/sites") + "&currentPage=1&currentPageSize=100"
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	resp, err := c.doGlobalRequest(ctx, http.MethodGet, "/sites", "&currentPage=1&currentPageSize=100", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -541,8 +763,7 @@ func (c *Client) ListSites(ctx context.Context) ([]Site, error) {
 
 // GetSite returns a single site by ID via GET /api/v2/sites/{siteId}.
 func (c *Client) GetSite(ctx context.Context, siteID string) (*Site, error) {
-	url := c.globalURL(fmt.Sprintf("/sites/%s", siteID))
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	resp, err := c.doGlobalRequest(ctx, http.MethodGet, fmt.Sprintf("/sites/%s", siteID), "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -555,8 +776,7 @@ func (c *Client) GetSite(ctx context.Context, siteID string) (*Site, error) {
 
 // CreateSite creates a new site via POST /api/v2/sites.
 func (c *Client) CreateSite(ctx context.Context, req *SiteCreateRequest) (string, error) {
-	url := c.globalURL("/sites")
-	resp, err := c.doRequest(ctx, http.MethodPost, url, req)
+	resp, err := c.doGlobalRequest(ctx, http.MethodPost, "/sites", "", req)
 	if err != nil {
 		return "", err
 	}
@@ -569,16 +789,14 @@ func (c *Client) CreateSite(ctx context.Context, req *SiteCreateRequest) (string
 
 // UpdateSite updates a site's name, region, timezone, and scenario via PATCH /sites/{id}/setting.
 func (c *Client) UpdateSite(ctx context.Context, siteID string, fields *SiteSettingFields) error {
-	url := fmt.Sprintf("%s/%s/api/v2/sites/%s/setting?token=%s", c.baseURL, c.omadacID, siteID, c.token)
 	payload := &SiteSettingUpdate{Site: fields}
-	_, err := c.doRequest(ctx, http.MethodPatch, url, payload)
+	_, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, "/setting", payload)
 	return err
 }
 
 // DeleteSite deletes a site via DELETE /api/v2/sites/{siteId}.
 func (c *Client) DeleteSite(ctx context.Context, siteID string) error {
-	url := c.globalURL(fmt.Sprintf("/sites/%s", siteID))
-	_, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	_, err := c.doGlobalRequest(ctx, http.MethodDelete, fmt.Sprintf("/sites/%s", siteID), "", nil)
 	return err
 }
 
@@ -613,6 +831,596 @@ func (c *Client) GetNetwork(ctx context.Context, siteID, networkID string) (*Net
 
 // CreateNetwork creates a new LAN network, or adopts an existing one with the
 // same name (the controller auto-creates a "Default" network on site creation).
+// InterfaceNetworkCreateRequest is the body for POST
+// /openapi/v1/{omadacId}/sites/{siteId}/networks/confirm — the v6 endpoint
+// that creates `purpose=interface` (L3) networks with the gateway as DHCP
+// server. The legacy /api/v2/setting/lan/networks POST cannot create
+// interface-purpose networks; it silently strips gatewaySubnet/dhcpSettings.
+//
+// Discovered via browser dev tools on OC200 v6 UI. Key fields:
+//   - DeviceConfig wraps deviceList + tagIds (NOT at top level)
+//   - LanNetwork carries the network parameters (gateway, DHCP, etc.)
+//   - No "purpose" field — the endpoint implicitly creates interface networks
+type InterfaceNetworkCreateRequest struct {
+	DeviceConfig InterfaceDeviceConfig `json:"deviceConfig"`
+	LanNetwork   InterfaceLanNetwork   `json:"lanNetwork"`
+}
+
+// InterfaceDeviceConfig holds device-level settings + the device list with
+// gateway MAC and port selections.
+type InterfaceDeviceConfig struct {
+	PortIsolationEnable bool                   `json:"portIsolationEnable"`
+	FlowControlEnable   bool                   `json:"flowControlEnable"`
+	DeviceList          []InterfaceDeviceEntry `json:"deviceList"`
+	TagIDs              []string               `json:"tagIds"`
+}
+
+// InterfaceDeviceEntry describes the gateway and the ports the new network
+// will be tagged on. `Type` is 1 for gateway devices.
+type InterfaceDeviceEntry struct {
+	Mac   string   `json:"mac"`
+	Type  int      `json:"type"`
+	Ports []string `json:"ports"`
+	Lags  []string `json:"lags"`
+}
+
+// InterfaceLanNetwork carries the L3 network parameters.
+//
+// IMPORTANT for the update path: the OC200 v6 UI populates ID, Application,
+// FastLeaveEnable, ExistMultiVlan, TotalIpNum, DhcpServerNum, and the
+// integer IPRangeStart/IPRangeEnd inside dhcpSettings in every /param-check,
+// /check, and /confirm body. Omitting any of them makes the
+// controller respond with "API error -1001: must not be null" (no field
+// name). UpdateInterfaceNetwork uses a read-merge strategy
+// (mergeInterfaceLanNetwork): fetch the current Network via
+// /api/v2 GET, overlay the user-controllable fields from the plan,
+// and submit. Read-back fields ride through unchanged so the
+// controller always sees what it sent us. Hard-coding defaults proved
+// fragile across controller versions.
+type InterfaceLanNetwork struct {
+	ID                   string                 `json:"id,omitempty"`
+	Name                 string                 `json:"name"`
+	DeviceMac            string                 `json:"deviceMac"`
+	DeviceType           int                    `json:"deviceType"`
+	VlanType             int                    `json:"vlanType"`
+	Vlan                 int                    `json:"vlan"`
+	GatewaySubnet        string                 `json:"gatewaySubnet"`
+	DHCPSettings         *InterfaceDHCPSettings `json:"dhcpSettings,omitempty"`
+	UpnpLanEnable        bool                   `json:"upnpLanEnable"`
+	IGMPSnoopEnable      bool                   `json:"igmpSnoopEnable"`
+	DhcpGuard            DhcpGuardSettings      `json:"dhcpGuard"`
+	DhcpV6Guard          DhcpGuardSettings      `json:"dhcpv6Guard"`
+	LanNetworkIPv6Config LanNetworkIPv6Config   `json:"lanNetworkIpv6Config"`
+	QosQueueEnable       bool                   `json:"qosQueueEnable"`
+	Isolation            bool                   `json:"isolation"`
+	MldSnoopEnable       bool                   `json:"mldSnoopEnable"`
+	ArpDetectionEnable   bool                   `json:"arpDetectionEnable"`
+	DhcpL2RelayEnable    bool                   `json:"dhcpL2RelayEnable"`
+	// Application is the network "application" classifier (0 = LAN, per the
+	// OC200 UI capture). Always emitted; the /check endpoint treats the
+	// missing field as null and rejects with -1001.
+	Application int `json:"application"`
+	// FastLeaveEnable mirrors the UI default (false on a standard LAN).
+	FastLeaveEnable bool `json:"fastLeaveEnable"`
+	// ExistMultiVlan mirrors the UI default (false unless the network has
+	// secondary VLANs attached, which the provider does not model yet).
+	ExistMultiVlan bool `json:"existMultiVlan"`
+	// TotalIpNum / DhcpServerNum are controller-computed read-back fields
+	// the /check endpoint expects to see echoed in the update body. Carried
+	// through via the read-merge in UpdateInterfaceNetwork. omitempty on
+	// CREATE because the controller derives them; on UPDATE we must echo
+	// whatever the controller currently reports.
+	TotalIpNum    int `json:"totalIpNum,omitempty"`
+	DhcpServerNum int `json:"dhcpServerNum,omitempty"`
+}
+
+// InterfaceDHCPSettings is the openapi/v1 DHCP shape — uses ipRangePool
+// (array) instead of ipaddrStart/ipaddrEnd, and adds gatewayMode + options.
+//
+// IMPORTANT: openapi/v1 uses different JSON tags than the legacy /api/v2
+// DHCPSettings struct. Per the OC200 UI capture for /networks/{id}/check
+// and /networks/{id}/confirm, the wire format is:
+//
+//   - "dhcpns"       — source flag: "auto" | "manual" (was dhcpns1/dhcpns2
+//     in legacy, conflated; openapi/v1 keeps the source distinct)
+//   - "priDns"       — primary DNS handed out to clients
+//   - "secondaryDns" — secondary DNS
+//
+// Sending the legacy dhcpns1/dhcpns2 tags here makes the controller silently
+// treat the request as "DNS source unchanged" and ignore the overrides.
+type InterfaceDHCPSettings struct {
+	Enable      bool          `json:"enable"`
+	IPRangePool []DhcpIPRange `json:"ipRangePool"`
+	// Dhcpns is the DNS source flag: "auto" (inherit gateway DNS) or
+	// "manual" (use PriDns / SecondaryDns). Without this field, the
+	// controller treats DNS-override fields as "unchanged".
+	Dhcpns string `json:"dhcpns,omitempty"`
+	// PriDns / SecondaryDns are the per-network DNS servers (DHCP option 6).
+	// Only meaningful when Dhcpns == "manual". omitempty keeps the
+	// controller in "auto" gateway-DNS mode when unset.
+	PriDns       string        `json:"priDns,omitempty"`
+	SecondaryDns string        `json:"secondaryDns,omitempty"`
+	LeaseTime    int           `json:"leasetime"`
+	GatewayMode  string        `json:"gatewayMode"`
+	Options      []interface{} `json:"options"`
+	// IPRangeStart / IPRangeEnd are the uint32 IP encodings the controller
+	// computes from IPRangePool and echoes back on /api/v2 GET (e.g.
+	// "ipRangeStart": 168440320 → 10.10.60.0). The openapi/v1 /check
+	// endpoint on UPDATE expects them present in the body — omitting them
+	// triggers "-1001: must not be null". omitempty so CREATE bodies
+	// (which do not have them yet) keep working.
+	IPRangeStart int64 `json:"ipRangeStart,omitempty"`
+	IPRangeEnd   int64 `json:"ipRangeEnd,omitempty"`
+}
+
+// LanNetworkIPv6Config — observed always sent as {proto:0, enable:0}
+// (IPv6 disabled) on IPv4-only networks.
+type LanNetworkIPv6Config struct {
+	Proto  int `json:"proto"`
+	Enable int `json:"enable"`
+}
+
+// InterfaceNetworkCreateResult is the response from POST /networks/confirm.
+type InterfaceNetworkCreateResult struct {
+	NetworkIDList []string `json:"networkIdList"`
+}
+
+// CreateInterfaceNetwork creates an L3 (purpose=interface) network via the
+// openapi/v1 endpoint and returns the created Network read back via the
+// legacy /api/v2 list endpoint (openapi/v1 list returns -1600).
+//
+// The openapi/v1 endpoint requires extra request headers:
+//   - Csrf-Token (same as legacy)
+//   - Omada-Request-Source: web-local (REQUIRED — without it, returns -44116)
+//   - X-Requested-With: XMLHttpRequest
+//
+// And does NOT use the ?token= query param.
+func (c *Client) CreateInterfaceNetwork(ctx context.Context, siteID string, req *InterfaceNetworkCreateRequest) (*Network, error) {
+	// Adopt pattern: check for an existing network with the same name.
+	existing, err := c.ListNetworks(ctx, siteID)
+	if err != nil {
+		return nil, fmt.Errorf("listing networks for adopt check: %w", err)
+	}
+	for _, n := range existing {
+		if n.Name == req.LanNetwork.Name {
+			return &n, nil
+		}
+	}
+
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
+
+	// Serialize the openapi/v1 POST itself (not the auth bootstrap).
+	// The controller's gateway-device provisioning path is serialized
+	// server-side and does NOT queue — concurrent /networks/confirm calls
+	// beyond ~5 in flight return errorCode -1 on the overflow. We hold a
+	// dedicated mutex (createMu) so we do not deadlock against ensureAuth,
+	// which takes c.mu above.
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
+
+	url := fmt.Sprintf("%s/openapi/v1/%s/sites/%s/networks/confirm", c.baseURL, c.omadacID, siteID)
+
+	// Bounded retry on transient -1 ("General error") responses only.
+	// The controller occasionally still returns -1 even when this POST is
+	// serialized, because the underlying device-provision step is async on
+	// the controller side. Other errors fail fast.
+	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	var resp *APIResponse
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, lastErr = c.doOpenAPIRequest(ctx, http.MethodPost, url, req)
+		if lastErr == nil {
+			break
+		}
+		if resp == nil || resp.ErrorCode != -1 {
+			return nil, lastErr
+		}
+		if attempt == 2 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoffs[attempt]):
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	var result InterfaceNetworkCreateResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("decoding network create result (raw: %s): %w", string(resp.Result), err)
+	}
+	if len(result.NetworkIDList) == 0 {
+		return nil, fmt.Errorf("network created but no ID in response: %s", string(resp.Result))
+	}
+
+	// Read back via the legacy /api/v2 list to get the full Network object
+	// (openapi/v1 list returns -1600 "Unsupported request path").
+	return c.GetNetwork(ctx, siteID, result.NetworkIDList[0])
+}
+
+// mergeInterfaceLanNetwork builds the openapi/v1 lanNetwork body by
+// overlaying the user-controllable fields from `plan` onto the controller's
+// current view of the network (`current`). Read-back / computed fields
+// (Application, FastLeaveEnable, ExistMultiVlan, TotalIpNum, DhcpServerNum,
+// plus the integer IPRangeStart/IPRangeEnd inside dhcpSettings) ride
+// through from `current` so the /check endpoint sees exactly what it
+// already knows about. The plan's DHCPSettings — when present — wins
+// outright because the provider treats DHCP as a single user-controlled
+// block (range pool + lease + DNS source). When the plan does NOT carry
+// a DHCPSettings (e.g. dhcp_enabled=false), the current settings are
+// translated to the openapi/v1 shape and reused.
+//
+// Important: this is the ONLY place that decides which fields are
+// "user-controlled" vs "controller-managed". Adding a new user-facing
+// attribute to the network resource means overlaying it here too.
+func mergeInterfaceLanNetwork(current *Network, plan *InterfaceLanNetwork, networkID string) InterfaceLanNetwork {
+	merged := InterfaceLanNetwork{
+		// id is REQUIRED in the body for /check and /confirm — URL alone
+		// is not enough.
+		ID: networkID,
+
+		// User-controlled overlays from the plan.
+		Name:                 plan.Name,
+		DeviceMac:            plan.DeviceMac,
+		DeviceType:           plan.DeviceType,
+		VlanType:             plan.VlanType,
+		Vlan:                 plan.Vlan,
+		GatewaySubnet:        plan.GatewaySubnet,
+		IGMPSnoopEnable:      plan.IGMPSnoopEnable,
+		DhcpGuard:            plan.DhcpGuard,
+		DhcpV6Guard:          plan.DhcpV6Guard,
+		LanNetworkIPv6Config: plan.LanNetworkIPv6Config,
+		Isolation:            plan.Isolation,
+		MldSnoopEnable:       plan.MldSnoopEnable,
+		ArpDetectionEnable:   plan.ArpDetectionEnable,
+		DhcpL2RelayEnable:    plan.DhcpL2RelayEnable,
+		UpnpLanEnable:        plan.UpnpLanEnable,
+		QosQueueEnable:       plan.QosQueueEnable,
+	}
+
+	// Read-back fields — copy as-is from current; the controller expects
+	// them echoed back unchanged.
+	if current != nil {
+		merged.Application = current.Application
+		merged.FastLeaveEnable = current.FastLeaveEnable
+		merged.ExistMultiVlan = current.ExistMultiVlan
+		merged.TotalIpNum = current.TotalIpNum
+		merged.DhcpServerNum = current.DhcpServerNum
+
+		// If the plan omitted gateway binding fields (older code paths
+		// may not set them), fall back to the controller's values so
+		// /check does not see empty deviceMac / deviceType.
+		if merged.DeviceMac == "" {
+			merged.DeviceMac = current.DeviceMac
+		}
+		if merged.DeviceType == 0 {
+			merged.DeviceType = current.DeviceType
+		}
+	}
+
+	// DHCP block: plan wins when provided; otherwise translate current's
+	// legacy /api/v2 shape to the openapi/v1 shape and reuse it. Either
+	// way, we want IPRangeStart/IPRangeEnd echoed back from current so the
+	// /check endpoint sees its own values.
+	switch {
+	case plan.DHCPSettings != nil:
+		merged.DHCPSettings = mergeInterfaceDHCPSettings(current, plan.DHCPSettings)
+	case current != nil && current.DHCPSettings != nil:
+		merged.DHCPSettings = convertLegacyDHCPToInterface(current.DHCPSettings)
+	}
+
+	return merged
+}
+
+// mergeInterfaceDHCPSettings overlays the plan's DHCP block (which the
+// provider populates from user input — range pool, lease time, DNS source,
+// DNS servers) and re-attaches the controller's read-back IP range
+// encodings from `current` so the /check endpoint does not flag them as
+// missing. The plan owns Enable / Pool / Lease / DNS; current contributes
+// IPRangeStart / IPRangeEnd. GatewayMode + Options are taken from current
+// when not set by the plan (provider does not model them yet).
+func mergeInterfaceDHCPSettings(current *Network, plan *InterfaceDHCPSettings) *InterfaceDHCPSettings {
+	merged := *plan // shallow copy — slices share backing array, fine here
+
+	if current == nil || current.DHCPSettings == nil {
+		return &merged
+	}
+	cd := current.DHCPSettings
+
+	// Echo back the controller-computed integer encodings. The /check
+	// endpoint sees these fields in its own GET response, so it expects
+	// them in our update body too.
+	if merged.IPRangeStart == 0 {
+		merged.IPRangeStart = cd.IPRangeStart
+	}
+	if merged.IPRangeEnd == 0 {
+		merged.IPRangeEnd = cd.IPRangeEnd
+	}
+	if merged.GatewayMode == "" {
+		if cd.GatewayMode != "" {
+			merged.GatewayMode = cd.GatewayMode
+		} else {
+			// Captured UI bodies always send "auto" for standard LANs;
+			// fall back to that when the legacy GET did not surface it.
+			merged.GatewayMode = "auto"
+		}
+	}
+	if merged.Options == nil {
+		if cd.Options != nil {
+			merged.Options = cd.Options
+		} else {
+			merged.Options = []interface{}{}
+		}
+	}
+	return &merged
+}
+
+// convertLegacyDHCPToInterface maps the /api/v2 DHCPSettings shape to the
+// openapi/v1 InterfaceDHCPSettings shape. Used by mergeInterfaceLanNetwork
+// when the plan does not carry a DHCP block but the current network has
+// one (e.g. terraform omitted dhcp_* but the network already has DHCP
+// configured — we still need to echo the current state to /check).
+func convertLegacyDHCPToInterface(legacy *DHCPSettings) *InterfaceDHCPSettings {
+	if legacy == nil {
+		return nil
+	}
+
+	pool := legacy.IPRangePool
+	if len(pool) == 0 && legacy.IPAddrStart != "" && legacy.IPAddrEnd != "" {
+		// Legacy may surface only the flat ipaddrStart/ipaddrEnd pair;
+		// openapi/v1 expects the pool array.
+		pool = []DhcpIPRange{{
+			IPAddrStart: legacy.IPAddrStart,
+			IPAddrEnd:   legacy.IPAddrEnd,
+		}}
+	}
+
+	gwMode := legacy.GatewayMode
+	if gwMode == "" {
+		gwMode = "auto"
+	}
+	options := legacy.Options
+	if options == nil {
+		options = []interface{}{}
+	}
+
+	return &InterfaceDHCPSettings{
+		Enable:       legacy.Enable,
+		IPRangePool:  pool,
+		Dhcpns:       legacy.Dhcpns,
+		PriDns:       legacy.PriDns,
+		SecondaryDns: legacy.SecondaryDns,
+		LeaseTime:    legacy.LeaseTime,
+		GatewayMode:  gwMode,
+		Options:      options,
+		IPRangeStart: legacy.IPRangeStart,
+		IPRangeEnd:   legacy.IPRangeEnd,
+	}
+}
+
+// UpdateInterfaceNetwork updates an existing L3 (purpose=interface) network
+// via the openapi/v1 4-step flow the OC200 v6 UI uses. The wire format was
+// captured byte-for-byte from the live OC200 UI and saved at
+// dist/probe-openapi-v1-update-uicapture/ for future reference:
+//
+//  1. POST /openapi/v1/{omadacId}/sites/{siteId}/networks/{id}/param-check
+//     — flat lanNetwork body (the merged read-back payload).
+//  2. POST /openapi/v1/{omadacId}/sites/{siteId}/networks/{id}/check
+//     — wrapped body: {deviceConfig:{}, lanNetwork, skipEnable:true}.
+//     Note deviceConfig is empty here; the actual deviceConfig only
+//     ships on confirm.
+//  3. POST /openapi/v1/{omadacId}/sites/{siteId}/networks/{id}/devices/ports
+//     — flat body: {macs:[...], vlanType, vlan, assignIpDeviceType:1}.
+//     Replaces the previous (incorrect) /ports-check call.
+//  4. PUT  /openapi/v1/{omadacId}/sites/{siteId}/networks/{id}/confirm
+//     — METHOD IS PUT, not POST. Body is the {deviceConfig, lanNetwork}
+//     envelope — the actual save.
+//
+// The previous 3-step implementation sent a naked lanNetwork body to /check
+// and got "API error -1001: must not be null" because the controller expects
+// the wrapped {deviceConfig, lanNetwork, skipEnable} envelope on /check.
+//
+// The legacy /api/v2/setting/lan/networks/{id} PATCH endpoint categorically
+// rejects mutations on interface-purpose networks with "API error -1:
+// General error". Use this method for purpose=interface networks; legacy
+// UpdateNetwork is fine for purpose=vlan.
+//
+// Same headers + ?token= omission as CreateInterfaceNetwork.
+// Confirm is wrapped in the same bounded -1 retry as Create; param-check,
+// check, and devices/ports validate fast and fail fast because empirically
+// they do not see transient -1 (no device write happens until confirm).
+func (c *Client) UpdateInterfaceNetwork(ctx context.Context, siteID, networkID string, req *InterfaceNetworkCreateRequest) (*Network, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
+
+	// Serialize the openapi/v1 mutation path. Same rationale as
+	// CreateInterfaceNetwork — the controller's gateway provisioning lane
+	// is not safe for concurrent writes; overflow returns errorCode -1.
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
+
+	// Read-merge: the openapi/v1 /check endpoint demands every field the
+	// controller knows about — including computed read-back fields like
+	// totalIpNum, dhcpServerNum, application, fastLeaveEnable,
+	// existMultiVlan, and the integer ipRangeStart/ipRangeEnd encodings
+	// inside dhcpSettings. Hard-coding the UI's defaults proved fragile
+	// across controller versions: each upgrade can add a new "must not be
+	// null" field. Fetching current state and overlaying the plan keeps
+	// us aligned with whatever the controller currently expects.
+	current, err := c.GetNetwork(ctx, siteID, networkID)
+	if err != nil {
+		return nil, fmt.Errorf("loading current network for update: %w", err)
+	}
+	req.LanNetwork = mergeInterfaceLanNetwork(current, &req.LanNetwork, networkID)
+
+	base := fmt.Sprintf("%s/openapi/v1/%s/sites/%s/networks/%s", c.baseURL, c.omadacID, siteID, networkID)
+
+	// Bounded retry around the FULL 4-step sequence. Previously only the
+	// PUT confirm was wrapped, on the assumption that param-check/check/
+	// devices-ports validate fast and never see transient -1. In practice,
+	// under load (e.g. 10 sequential network updates × 4 openapi/v1 POSTs
+	// each), param-check and check have also returned "API error -1:
+	// General error". isTransientMinus1 keeps real validation errors
+	// (like -1001 "must not be null") failing fast on the first attempt.
+	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		err := c.runUpdateSequence(ctx, base, req)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		if !isTransientMinus1(err) {
+			return nil, err
+		}
+		lastErr = err
+		if attempt == 2 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoffs[attempt]):
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	// Confirm responses on update do not reliably echo the full Network
+	// object (the create variant returns a networkIdList, update may
+	// return an empty result). Re-read via the legacy /api/v2 GET to
+	// produce a consistent Network for state.
+	return c.GetNetwork(ctx, siteID, networkID)
+}
+
+// runUpdateSequence performs the 4-step openapi/v1 update flow:
+// param-check, check, devices/ports, and the confirm PUT. Errors from
+// each step are wrapped with their step name so callers (and the retry
+// loop above) can tell where -1 came from. The actual save only happens
+// on step 4 (PUT confirm); steps 1-3 are validation passes.
+func (c *Client) runUpdateSequence(ctx context.Context, base string, req *InterfaceNetworkCreateRequest) error {
+	// Step 1: param-check. Body is the flat lanNetwork payload (the merged
+	// read-back). This is the validation pass that previously lived at
+	// /check with the wrong body shape.
+	if _, err := c.doOpenAPIRequest(ctx, http.MethodPost, base+"/param-check", req.LanNetwork); err != nil {
+		return fmt.Errorf("network update param-check failed: %w", err)
+	}
+
+	// Step 2: check. Body wraps lanNetwork in the {deviceConfig:{},
+	// lanNetwork, skipEnable:true} envelope per the UI capture. The empty
+	// deviceConfig here is intentional — the populated deviceConfig only
+	// ships on confirm. map[string]interface{} keeps the empty object
+	// explicit (struct{}{} marshals to "{}").
+	checkBody := map[string]interface{}{
+		"deviceConfig": struct{}{},
+		"lanNetwork":   req.LanNetwork,
+		"skipEnable":   true,
+	}
+	if _, err := c.doOpenAPIRequest(ctx, http.MethodPost, base+"/check", checkBody); err != nil {
+		return fmt.Errorf("network update check failed: %w", err)
+	}
+
+	// Step 3: devices/ports — port-binding validation. Body is the flat
+	// {macs, vlanType, vlan, assignIpDeviceType} shape.
+	//
+	// The UI capture sent macs=[switchMac, gatewayMac]. We currently only
+	// have the gateway MAC available cheaply (req.DeviceConfig.DeviceList
+	// carries it). Switch MAC discovery would require an extra round trip
+	// to enumerate site devices and filter by interface binding — defer
+	// that until we observe the controller actually rejecting the
+	// single-MAC form. If the controller returns -1001 here we'll iterate.
+	macs := make([]string, 0, len(req.DeviceConfig.DeviceList))
+	for _, dev := range req.DeviceConfig.DeviceList {
+		if dev.Mac != "" {
+			macs = append(macs, dev.Mac)
+		}
+	}
+	devicesPortsBody := struct {
+		Macs               []string `json:"macs"`
+		VlanType           int      `json:"vlanType"`
+		Vlan               int      `json:"vlan"`
+		AssignIPDeviceType int      `json:"assignIpDeviceType"`
+	}{
+		Macs:               macs,
+		VlanType:           req.LanNetwork.VlanType,
+		Vlan:               req.LanNetwork.Vlan,
+		AssignIPDeviceType: 1,
+	}
+	if _, err := c.doOpenAPIRequest(ctx, http.MethodPost, base+"/devices/ports", devicesPortsBody); err != nil {
+		return fmt.Errorf("network update devices/ports failed: %w", err)
+	}
+
+	// Step 4: confirm — the actual save. METHOD IS PUT (not POST).
+	if _, err := c.doOpenAPIRequest(ctx, http.MethodPut, base+"/confirm", req); err != nil {
+		return fmt.Errorf("network update confirm failed: %w", err)
+	}
+	return nil
+}
+
+// isTransientMinus1 reports whether err originated from an Omada API
+// errorCode == -1 ("General error"). The doOpenAPIRequest path formats
+// errors as "API error %d: %s" — we scan for the marker rather than
+// plumb a typed error so we do not have to break the existing signature.
+// Validation failures use distinct codes (-1001 for "must not be null",
+// etc.) and intentionally fail fast without retry.
+func isTransientMinus1(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "API error -1:")
+}
+
+// doOpenAPIRequest sends a request to the openapi/v1 surface. Adds the
+// session-bridge headers the v6 UI uses and omits the ?token= query param.
+func (c *Client) doOpenAPIRequest(ctx context.Context, method, url string, body interface{}) (*APIResponse, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling request body: %w", err)
+		}
+		bodyReader = bytes.NewReader(jsonBody)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Csrf-Token", c.token)
+	req.Header.Set("Omada-Request-Source", "web-local")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", method, url, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return nil, fmt.Errorf("decoding response (status %d, body: %s): %w", resp.StatusCode, string(respBody), err)
+	}
+	if apiResp.ErrorCode != 0 {
+		return &apiResp, fmt.Errorf("API error %d: %s", apiResp.ErrorCode, apiResp.Msg)
+	}
+	return &apiResp, nil
+}
+
 func (c *Client) CreateNetwork(ctx context.Context, siteID string, network *Network) (*Network, error) {
 	// Check for an existing network with the same name (adopt pattern).
 	existing, err := c.ListNetworks(ctx, siteID)
@@ -650,8 +1458,24 @@ func (c *Client) CreateNetwork(ctx context.Context, siteID string, network *Netw
 	return nil, fmt.Errorf("network created but no ID in response: %s", string(resp.Result))
 }
 
-// UpdateNetwork updates an existing LAN network.
+// UpdateNetwork updates an existing LAN network via the legacy
+// /api/v2/setting/lan/networks/{id} PATCH endpoint.
+//
+// IMPORTANT: this endpoint works for purpose=vlan networks only. For
+// purpose=interface networks the controller categorically rejects PATCH
+// here with "API error -1: General error" — those go through
+// UpdateInterfaceNetwork (openapi/v1 4-step param-check / check /
+// devices/ports / PUT confirm flow).
+//
+// Serialization rationale: kept on createMu as a cheap safety net. Legacy
+// PATCH is low-volume (vlan-only) and has not been observed to hit the
+// throughput-cap issue that motivated serializing CreateInterfaceNetwork,
+// but a single extra lock acquisition per vlan update is negligible and
+// removes a footgun for any future caller batching many vlan updates.
 func (c *Client) UpdateNetwork(ctx context.Context, siteID, networkID string, network *Network) (*Network, error) {
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
+
 	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/setting/lan/networks/%s", networkID), network)
 	if err != nil {
 		return nil, err
@@ -666,9 +1490,35 @@ func (c *Client) UpdateNetwork(ctx context.Context, siteID, networkID string, ne
 	return &updated, nil
 }
 
-// DeleteNetwork deletes a LAN network.
+// DeleteNetwork deletes a LAN network via /api/v2.
+//
+// Serialized via createMu as a cheap safety net (same rationale as the
+// updated UpdateNetwork doc above).
+//
+// TODO: confirm whether interface-purpose networks need the openapi/v1
+// delete endpoint (POST /openapi/v1/.../networks/{id}/delete or similar).
+// Capture the UI's delete request before changing — guessing here would
+// produce the same -1 errors the Update path hit when we assumed /api/v2.
 func (c *Client) DeleteNetwork(ctx context.Context, siteID, networkID string) error {
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
+
 	_, err := c.doSiteRequest(ctx, siteID, http.MethodDelete, fmt.Sprintf("/setting/lan/networks/%s", networkID), nil)
+	return err
+}
+
+// ForceProvisionDevice tells the controller to push the latest stored
+// configuration to a specific device (gateway / switch / AP). Required
+// after creating a purpose=interface network via openapi/v1, because the
+// controller stores the new VLAN in its DB but does NOT automatically
+// push the device-side config — the ER707 stays "half-provisioned"
+// until either someone clicks Force Provision in the OC200 UI or this
+// endpoint is called from code.
+//
+// Endpoint: POST /api/v2/sites/{siteId}/cmd/devices/{deviceMac}/forceProvision
+// Body: none.
+func (c *Client) ForceProvisionDevice(ctx context.Context, siteID, deviceMac string) error {
+	_, err := c.doSiteRequest(ctx, siteID, http.MethodPost, fmt.Sprintf("/cmd/devices/%s/forceProvision", deviceMac), nil)
 	return err
 }
 
@@ -903,7 +1753,15 @@ func (c *Client) CreatePortProfile(ctx context.Context, siteID string, profile *
 	return &created, nil
 }
 
-// UpdatePortProfile updates a port profile.
+// UpdatePortProfile updates a port profile via the legacy
+// /api/v2/setting/lan/profiles/{id} PATCH endpoint.
+//
+// Deprecated: on v6 controllers this endpoint returns errorCode -33854
+// ("The VLAN configuration for this profile has been disabled in the
+// new UI") once the controller marks a profile as managed by the new
+// UI. Resource updates now route through UpdatePortProfileV2, which
+// hits the openapi/v2 lan-profiles path. Retained for any non-Update
+// caller (e.g. CreatePortProfile's adopt path) until each is migrated.
 func (c *Client) UpdatePortProfile(ctx context.Context, siteID, profileID string, profile *PortProfile) (*PortProfile, error) {
 	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/setting/lan/profiles/%s", profileID), profile)
 	if err != nil {
@@ -917,6 +1775,112 @@ func (c *Client) UpdatePortProfile(ctx context.Context, siteID, profileID string
 		return nil, fmt.Errorf("decoding updated port profile: %w", err)
 	}
 	return &updated, nil
+}
+
+// UpdatePortProfileV2 updates a port (LAN) profile via the openapi/v2
+// endpoint that the v6 controller introduced. The legacy
+// /api/v2/setting/lan/profiles/{id} PATCH path returns errorCode -33854
+// ("The VLAN configuration for this profile has been disabled in the
+// new UI") once the controller marks a profile as managed by the new
+// UI (vlanConfigEnable=false); the openapi/v2 path is the only way to
+// mutate tagNetworkIds / untagNetworkIds / nativeNetworkId on those
+// profiles.
+//
+// Endpoint: PATCH /openapi/v2/{omadacId}/sites/{siteId}/lan-profiles/{id}
+// Body: full PortProfileV2 (read-merge against the existing profile,
+// then overlay the three TF-controlled fields). Headers: doOpenAPIRequest
+// already adds csrf + omada-request-source.
+//
+// IMPORTANT: the body MUST include "vlanConfigEnable": true. The error
+// message -33854 says VLAN config has been disabled in the new UI;
+// setting this flag back to true is the unlock that lets VLAN edits land.
+// UpdatePortProfileV2 forces this regardless of what GET reported, so
+// callers do not have to remember to flip it.
+//
+// Serialization: shares createMu with UpdateInterfaceNetwork. Port
+// profile and L3 network mutations are different lanes server-side, but
+// the gateway-config provisioning queue is the same; concurrent writes
+// have been observed to return transient errorCode -1 ("General error")
+// on the same throughput-cap that motivated the network serialization.
+// One mutex for both keeps the cap predictable.
+//
+// Retry: bounded retry on errorCode -1 only (same isTransientMinus1
+// helper as UpdateInterfaceNetwork). Validation failures (e.g. -33854,
+// -1001) intentionally fail fast on the first attempt.
+//
+// Post-PATCH read-back: the controller response is just
+// {"errorCode":0,"msg":"Success."} — no profile echoed back. We re-read
+// via the existing GetPortProfile (legacy /api/v2 GET, which still
+// returns the full profile shape) to give callers a populated struct
+// for state.
+//
+// NOTE: only Update is captured. CreatePortProfile and DeletePortProfile
+// have not been observed returning -33854 and remain on /api/v2. File a
+// follow-up if Create starts failing on v6 controllers — the same
+// openapi/v2 lan-profiles surface likely exposes a POST.
+func (c *Client) UpdatePortProfileV2(ctx context.Context, siteID, profileID string, body *PortProfileV2) (*PortProfile, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
+
+	// Serialize against the same gateway-config lane as
+	// UpdateInterfaceNetwork. See doc above for rationale.
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
+
+	// Always force the unlock flag, regardless of caller intent. The
+	// whole reason this method exists is that the controller silently
+	// flips vlanConfigEnable to false; we MUST flip it back on every
+	// PATCH or the controller keeps returning -33854.
+	body.VlanConfigEnable = true
+	// Defend against nil slices marshalling to "null" — the v6 UI
+	// captured these as [] when empty, and the controller is strict.
+	if body.UntagNetworkIDs == nil {
+		body.UntagNetworkIDs = []string{}
+	}
+	if body.TagNetworkIDs == nil {
+		body.TagNetworkIDs = []string{}
+	}
+	if body.ESEnableTaggedNetworkIDs == nil {
+		body.ESEnableTaggedNetworkIDs = []string{}
+	}
+	if body.Instances == nil {
+		body.Instances = []interface{}{}
+	}
+
+	url := fmt.Sprintf("%s/openapi/v2/%s/sites/%s/lan-profiles/%s", c.baseURL, c.omadacID, siteID, profileID)
+
+	// Bounded retry on transient errorCode -1. Mirrors the retry loop
+	// in CreateInterfaceNetwork / UpdateInterfaceNetwork.
+	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := c.doOpenAPIRequest(ctx, http.MethodPatch, url, body)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		if !isTransientMinus1(err) {
+			return nil, err
+		}
+		lastErr = err
+		if attempt == 2 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoffs[attempt]):
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	// Response is just {"errorCode":0,"msg":"Success."}. Re-read via
+	// the legacy /api/v2 list-and-filter GET to return a populated
+	// PortProfile for state.
+	return c.GetPortProfile(ctx, siteID, profileID)
 }
 
 // DeletePortProfile deletes a port profile.
@@ -1390,25 +2354,62 @@ type SwitchSNMP struct {
 	Contact  string `json:"contact"`
 }
 
+// MirroredPortRef is a single entry in the per-switch GET mirroredPorts array.
+// The per-switch read returns objects {port, portName} — not flat ints.
+// The write body (SwitchPortV2.MirroredPorts []int) uses flat ints; these are
+// two distinct wire shapes.
+type MirroredPortRef struct {
+	Port int `json:"port"`
+}
+
 // SwitchPort represents a port configuration on a switch.
 type SwitchPort struct {
-	ID                    string   `json:"id,omitempty"`
-	Port                  int      `json:"port"`
-	Name                  string   `json:"name"`
-	Disable               bool     `json:"disable"`
-	Type                  int      `json:"type"`
-	MaxSpeed              int      `json:"maxSpeed,omitempty"`
-	NativeNetworkID       string   `json:"nativeNetworkId,omitempty"`
-	NetworkTagsSetting    int      `json:"networkTagsSetting"`
-	TagNetworkIDs         []string `json:"tagNetworkIds"`
-	UntagNetworkIDs       []string `json:"untagNetworkIds"`
-	VoiceNetworkEnable    bool     `json:"voiceNetworkEnable"`
-	VoiceDscpEnable       bool     `json:"voiceDscpEnable"`
-	ProfileID             string   `json:"profileId"`
-	ProfileName           string   `json:"profileName,omitempty"`
-	ProfileOverrideEnable bool     `json:"profileOverrideEnable"`
-	Operation             string   `json:"operation,omitempty"`
-	Speed                 int      `json:"speed"`
+	ID                        string            `json:"id,omitempty"`
+	Port                      int               `json:"port"`
+	Name                      string            `json:"name"`
+	Disable                   bool              `json:"disable"`
+	Type                      int               `json:"type"`
+	MaxSpeed                  int               `json:"maxSpeed,omitempty"`
+	NativeNetworkID           string            `json:"nativeNetworkId,omitempty"`
+	NetworkTagsSetting        int               `json:"networkTagsSetting"`
+	TagNetworkIDs             []string          `json:"tagNetworkIds"`
+	UntagNetworkIDs           []string          `json:"untagNetworkIds"`
+	VoiceNetworkEnable        bool              `json:"voiceNetworkEnable"`
+	VoiceDscpEnable           bool              `json:"voiceDscpEnable"`
+	ProfileID                 string            `json:"profileId"`
+	ProfileName               string            `json:"profileName,omitempty"`
+	ProfileOverrideEnable     bool              `json:"profileOverrideEnable"`
+	ProfileVlanOverrideEnable bool              `json:"profileVlanOverrideEnable"`
+	Operation                 string            `json:"operation,omitempty"`
+	MirroredPorts             []MirroredPortRef `json:"mirroredPorts,omitempty"`
+	Speed                     int               `json:"speed"`
+}
+
+// SwitchPortV2 is the openapi/v1 PATCH body for a single switch port.
+// Distinct from SwitchPort (the api/v2 GET shape). The field set was captured
+// from the v6 web UI; api/v2-only fields (port, disable, voiceDscpEnable,
+// type, maxSpeed) are intentionally absent. tagIds replaces tagNetworkIds;
+// untagNetworkIds is dropped (controller derives untag=[native] automatically).
+//
+// Pointer fields follow the Unknown/Null/Known rule:
+//   - nil   → omitted from JSON (Unknown — controller preserves current value)
+//   - &zero → sent as zero (Known or Null — explicit intent)
+//   - &v    → sent as v
+//
+// This prevents clobbering fields the user did not configure.
+type SwitchPortV2 struct {
+	Name                      string    `json:"name"`
+	ProfileID                 string    `json:"profileId,omitempty"`
+	ProfileOverrideEnable     bool      `json:"profileOverrideEnable"`
+	ProfileVlanOverrideEnable bool      `json:"profileVlanOverrideEnable"`
+	NativeNetworkID           string    `json:"nativeNetworkId,omitempty"`
+	NetworkTagsSetting        *int      `json:"networkTagsSetting,omitempty"`
+	TagIDs                    *[]string `json:"tagIds,omitempty"`
+	VoiceNetworkEnable        bool      `json:"voiceNetworkEnable"`
+	LinkSpeed                 *int      `json:"linkSpeed,omitempty"`
+	Duplex                    *int      `json:"duplex,omitempty"`
+	Operation                 string    `json:"operation,omitempty"`
+	MirroredPorts             []int     `json:"mirroredPorts,omitempty"`
 }
 
 // SwitchServiceConfig is the payload for PUT /switches/{mac}/config/service.
@@ -1549,11 +2550,164 @@ func (c *Client) UpdateSwitchConfig(ctx context.Context, siteID, mac string, con
 	return &updated, nil
 }
 
+// speedToLinkSpeedDuplex maps the Terraform schema speed code to the openapi/v1
+// {linkSpeed, duplex} pair captured from a live SG3218XP-M2 controller.
+// Only confirmed entries are listed; unknown codes fall back to (0,0) = auto-negotiate.
+// Reference: GitHub issue #40 / design ADR-3.
+//
+// Speed code meanings (api/v2 schema):
+//
+//	0 = auto-neg, 1 = 10Mb HD, 2 = 10Mb FD, 3 = 100Mb HD, 4 = 100Mb FD,
+//	5 = 1Gb FD,   6 = 2.5Gb FD, 7 = 5Gb FD,  8 = 10Gb FD
+var speedToLinkSpeedDuplex = map[int]struct{ LinkSpeed, Duplex int }{
+	0: {0, 0}, // auto-neg
+	3: {2, 1}, // 100Mb HD
+	4: {2, 2}, // 100Mb FD
+	5: {3, 2}, // 1Gb FD
+	6: {4, 2}, // 2.5Gb FD
+	// Codes 1,2,7,8 have no confirmed openapi linkSpeed values.
+	// They fall back to (0,0) auto-negotiate — safe universal default.
+}
+
+// SpeedToLinkDuplex translates a Terraform schema speed code to the
+// openapi/v1 linkSpeed and duplex integer pair. Unknown speed codes fall back
+// to (0,0) (auto-negotiate). Exported so the resource layer can use it in
+// buildSwitchPortV2Body without duplicating the table.
+func SpeedToLinkDuplex(speed int) (linkSpeed, duplex int) {
+	if pair, ok := speedToLinkSpeedDuplex[speed]; ok {
+		return pair.LinkSpeed, pair.Duplex
+	}
+	return 0, 0
+}
+
 // UpdateSwitchPort updates a single port on a switch via PATCH /switches/{mac}/ports/{port}.
 // This endpoint works universally across all switch series without the /es/ prefix.
 func (c *Client) UpdateSwitchPort(ctx context.Context, siteID, mac string, port int, config map[string]interface{}) error {
 	_, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/switches/%s/ports/%d", mac, port), config)
 	return err
+}
+
+// UpdateSwitchPortV2 PATCHes a single switch port via the openapi/v1 surface,
+// mirroring UpdatePortProfileV2. Auth is via Csrf-Token header (no ?token=).
+//
+// The method:
+//  1. Forces ProfileOverrideEnable=true when Operation=="mirroring" — the
+//     controller requires Custom mode (override) for mirroring to persist.
+//  2. Forces ProfileVlanOverrideEnable=true when ProfileOverrideEnable is true
+//     and NativeNetworkID is non-empty (access_* profiles require it; omitting
+//     it returns -39840).
+//  3. VLAN derivation for profiles with vlanConfigEnable=false: when override
+//     is off and no explicit NativeNetworkID is set, fetches the bound profile
+//     and copies its nativeNetworkId, networkTagsSetting, and tagNetworkIds
+//     into the body, setting profileVlanOverrideEnable=true. This prevents
+//     -39840 for access_*/trunk_* profiles whose VLAN the openapi surface
+//     cannot derive server-side. Best-effort: on profile fetch error the PATCH
+//     is sent as-is and the controller returns its own descriptive error.
+//  4. Nil pointer fields (Unknown Terraform attrs) are omitted from JSON so
+//     the controller preserves current values — no nil-to-empty coercion.
+//  5. Retries on transient errorCode -1 with 500ms/1s/2s backoffs.
+//  6. Re-reads the port via the legacy api/v2 GET and returns the full
+//     SwitchPort struct (the openapi PATCH response is just {errorCode:0}).
+//
+// Read path stays api/v2 (ADR-5). The legacy UpdateSwitchPort remains intact.
+func (c *Client) UpdateSwitchPortV2(ctx context.Context, siteID, mac string, port int, body *SwitchPortV2) (*SwitchPort, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return nil, err
+	}
+
+	// Serialize on the same gateway/provisioning lane as UpdatePortProfileV2.
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
+
+	// Mirroring requires Custom (override) mode — force it so the operation
+	// persists after apply instead of reverting to Switching.
+	if body.Operation == "mirroring" {
+		body.ProfileOverrideEnable = true
+	}
+
+	// Force profileVlanOverrideEnable for access_* profiles. The controller
+	// silently requires it when profileOverrideEnable=true + nativeNetworkId
+	// is set; omitting it returns -39840.
+	if body.ProfileOverrideEnable && body.NativeNetworkID != "" {
+		body.ProfileVlanOverrideEnable = true
+	}
+
+	// VLAN derivation for profiles with vlanConfigEnable=false.
+	// The openapi/v1 write path does NOT derive VLAN server-side (unlike
+	// the legacy api/v2 write). When a profile has vlanConfigEnable=false
+	// and the caller has not supplied an override or explicit native VLAN,
+	// we fetch the profile and copy its VLAN settings into the body so the
+	// controller accepts the request (otherwise it returns -39840).
+	// This is best-effort: if the profile fetch fails we proceed without
+	// derivation and let the controller return its own descriptive error.
+	if !body.ProfileOverrideEnable && body.ProfileID != "" && body.NativeNetworkID == "" {
+		if prof, err := c.GetPortProfile(ctx, siteID, body.ProfileID); err == nil && !prof.VlanConfigEnable {
+			body.ProfileVlanOverrideEnable = true
+			body.NativeNetworkID = prof.NativeNetworkID
+			nts := prof.NetworkTagsSetting
+			body.NetworkTagsSetting = &nts
+			if prof.TagNetworkIDs == nil {
+				empty := []string{}
+				body.TagIDs = &empty
+			} else {
+				body.TagIDs = &prof.TagNetworkIDs
+			}
+		}
+	}
+
+	// NOTE: nil TagIDs pointer is intentional — it means "omit from JSON so
+	// the controller preserves current tagged VLANs". Do NOT coerce nil to [].
+	// The caller (buildSwitchPortV2Body) sets &[]string{} when the model is
+	// Null (user explicitly cleared), which marshals as [].
+
+	url := fmt.Sprintf("%s/openapi/v1/%s/sites/%s/switches/%s/ports/%d",
+		c.baseURL, c.omadacID, siteID, mac, port)
+
+	// Bounded retry on transient errorCode -1. Mirrors UpdatePortProfileV2.
+	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := c.doOpenAPIRequest(ctx, http.MethodPatch, url, body)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		if !isTransientMinus1(err) {
+			return nil, err
+		}
+		lastErr = err
+		if attempt == 2 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoffs[attempt]):
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	// Response is just {"errorCode":0,"msg":"Success."}. Re-read via the
+	// legacy api/v2 GET to return a populated SwitchPort for state.
+	return c.GetSwitchPort(ctx, siteID, mac, port)
+}
+
+// GetSwitchPort fetches the full switch config and returns a single port by
+// number (1-based). Returns ErrNotFound if the port doesn't exist (e.g.,
+// out-of-range index for the switch model).
+func (c *Client) GetSwitchPort(ctx context.Context, siteID, mac string, port int) (*SwitchPort, error) {
+	cfg, err := c.GetSwitchConfig(ctx, siteID, mac)
+	if err != nil {
+		return nil, fmt.Errorf("getting switch config for port lookup: %w", err)
+	}
+	for i := range cfg.Ports {
+		if cfg.Ports[i].Port == port {
+			return &cfg.Ports[i], nil
+		}
+	}
+	return nil, fmt.Errorf("port %d not found on switch %s (switch has %d ports)", port, mac, len(cfg.Ports))
 }
 
 // UpdateSwitchServiceConfig updates switch service settings via PUT /switches/{mac}/config/service.
@@ -1573,32 +2727,67 @@ func (c *Client) UpdateSwitchServiceConfig(ctx context.Context, siteID, mac stri
 // --- Firewall ACL Rules ---
 
 // ACLDirection specifies which traffic directions an ACL applies to.
+// WanInIDs and VpnInIDs must serialize as [] (never omitted) to satisfy the
+// controller's schema validation.
 type ACLDirection struct {
+	WanInIDs []string `json:"wanInIds"`
+	VpnInIDs []string `json:"vpnInIds"`
 	LanToWan bool     `json:"lanToWan"`
 	LanToLan bool     `json:"lanToLan"`
-	WanInIDs []string `json:"wanInIds,omitempty"`
-	VpnInIDs []string `json:"vpnInIds,omitempty"`
 }
 
 // ACLRule represents a firewall ACL rule.
+// CustomAclOsws, CustomAclStacks, and CustomAclDevices must serialize as []
+// (never omitted) to satisfy the controller's schema validation.
 type ACLRule struct {
-	ID              string       `json:"id,omitempty"`
-	Name            string       `json:"name"`
-	Type            int          `json:"type"`            // 0=gateway, 1=switch, 2=eap
-	Index           int          `json:"index,omitempty"` // rule ordering (first-match-wins)
-	Status          bool         `json:"status"`          // enabled/disabled
-	Policy          int          `json:"policy"`          // 0=deny, 1=permit
-	Protocols       []int        `json:"protocols"`       // 6=TCP, 17=UDP, 1=ICMP, etc.
-	SourceType      int          `json:"sourceType"`      // 0=network, 2=ip_group
-	SourceIDs       []string     `json:"sourceIds"`
-	DestinationType int          `json:"destinationType"` // 0=network, 2=ip_group
-	DestinationIDs  []string     `json:"destinationIds"`
-	Direction       ACLDirection `json:"direction"`
-	StateMode       int          `json:"stateMode,omitempty"` // 0=auto (stateful)
-	BiDirectional   bool         `json:"biDirectional,omitempty"`
-	IPSec           int          `json:"ipSec,omitempty"`
-	Syslog          bool         `json:"syslog,omitempty"`
-	Resource        int          `json:"resource,omitempty"`
+	ID               string       `json:"id,omitempty"`
+	Name             string       `json:"name"`
+	Type             int          `json:"type"`            // 0=gateway, 1=switch, 2=eap
+	Index            int          `json:"index,omitempty"` // rule ordering (first-match-wins)
+	Status           bool         `json:"status"`          // enabled/disabled
+	Policy           int          `json:"policy"`          // 0=deny, 1=permit
+	Protocols        []int        `json:"protocols"`       // 6=TCP, 17=UDP, 1=ICMP, 256=any
+	SourceType       int          `json:"sourceType"`      // 0=network, 1=ip_group
+	SourceIDs        []string     `json:"sourceIds"`
+	DestinationType  int          `json:"destinationType"` // 0=network, 1=ip_group
+	DestinationIDs   []string     `json:"destinationIds"`
+	Direction        ACLDirection `json:"direction"`
+	StateMode        int          `json:"stateMode,omitempty"` // 0=auto (stateful)
+	BiDirectional    bool         `json:"biDirectional,omitempty"`
+	IPSec            int          `json:"ipSec,omitempty"`
+	Syslog           bool         `json:"syslog,omitempty"`
+	Resource         int          `json:"resource,omitempty"`
+	CustomAclOsws    []string     `json:"customAclOsws"`
+	CustomAclStacks  []string     `json:"customAclStacks"`
+	CustomAclDevices []string     `json:"customAclDevices"`
+}
+
+// normalizeACLRule ensures nil slices that must serialize as [] are initialized
+// to empty (non-nil) slices before marshaling.
+// SourceIDs / DestinationIDs must be [] (not null) even for "any" rules;
+// the controller rejects null with -33609 "Choose the source and destination".
+func normalizeACLRule(rule *ACLRule) {
+	if rule.SourceIDs == nil {
+		rule.SourceIDs = []string{}
+	}
+	if rule.DestinationIDs == nil {
+		rule.DestinationIDs = []string{}
+	}
+	if rule.CustomAclOsws == nil {
+		rule.CustomAclOsws = []string{}
+	}
+	if rule.CustomAclStacks == nil {
+		rule.CustomAclStacks = []string{}
+	}
+	if rule.CustomAclDevices == nil {
+		rule.CustomAclDevices = []string{}
+	}
+	if rule.Direction.WanInIDs == nil {
+		rule.Direction.WanInIDs = []string{}
+	}
+	if rule.Direction.VpnInIDs == nil {
+		rule.Direction.VpnInIDs = []string{}
+	}
 }
 
 // ACLListResult wraps the paginated ACL list response with metadata.
@@ -1651,12 +2840,44 @@ func (c *Client) GetACLRule(ctx context.Context, siteID, ruleID string, aclType 
 }
 
 // CreateACLRule creates a new ACL rule.
+// The Omada controller response varies by version:
+//   - v6.x live: bare string ID (or empty string) — not a full ACLRule object.
+//   - Some versions: full ACLRule object.
+//
+// Strategy (mirrors CreateIPGroup):
+//  1. Empty result → list all rules and match by name.
+//  2. String ID    → GetACLRule (list+match by id) to return the full rule.
+//  3. Full object  → return it directly (legacy/future-proof path).
 func (c *Client) CreateACLRule(ctx context.Context, siteID string, rule *ACLRule) (*ACLRule, error) {
+	normalizeACLRule(rule)
 	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/firewall/acls", rule)
 	if err != nil {
 		return nil, err
 	}
 
+	// Empty result path: controller returned no id.
+	// List all rules of this type and match by name.
+	if isEmptyResult(resp.Result) {
+		rules, err := c.ListACLRules(ctx, siteID, rule.Type)
+		if err != nil {
+			return nil, fmt.Errorf("listing ACL rules after create (no id in response): %w", err)
+		}
+		for i := range rules {
+			if rules[i].Name == rule.Name {
+				return &rules[i], nil
+			}
+		}
+		return nil, fmt.Errorf("ACL rule %q not found after create", rule.Name)
+	}
+
+	// Try to unmarshal result as a string ID (the live v6 API response shape).
+	var ruleID string
+	if err := json.Unmarshal(resp.Result, &ruleID); err == nil && ruleID != "" {
+		// String-id path: fetch the full rule by id (list + match).
+		return c.GetACLRule(ctx, siteID, ruleID, rule.Type)
+	}
+
+	// Full-object path: controller returned a complete ACLRule (legacy/future).
 	var created ACLRule
 	if err := json.Unmarshal(resp.Result, &created); err != nil {
 		return nil, fmt.Errorf("decoding created ACL rule: %w", err)
@@ -1664,9 +2885,12 @@ func (c *Client) CreateACLRule(ctx context.Context, siteID string, rule *ACLRule
 	return &created, nil
 }
 
-// UpdateACLRule updates an existing ACL rule.
+// UpdateACLRule updates an existing ACL rule via PUT.
+// The v6/ER707 controller returns -1600 ("Unsupported request path") for PATCH
+// on ACL endpoints; PUT is the correct verb per the UI-observed API contract.
 func (c *Client) UpdateACLRule(ctx context.Context, siteID, ruleID string, rule *ACLRule) (*ACLRule, error) {
-	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/setting/firewall/acls/%s", ruleID), rule)
+	normalizeACLRule(rule)
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPut, fmt.Sprintf("/setting/firewall/acls/%s", ruleID), rule)
 	if err != nil {
 		return nil, err
 	}
@@ -1686,26 +2910,109 @@ func (c *Client) DeleteACLRule(ctx context.Context, siteID, ruleID string) error
 	return err
 }
 
+// ModifyACLIndex reorders ACL rules by submitting a map of rule-ID → position
+// index. aclType: 0=gateway, 1=switch, 2=eap.
+// Endpoint: POST /api/v2/sites/{site}/cmd/acls/modifyIndex
+func (c *Client) ModifyACLIndex(ctx context.Context, siteID string, aclType int, indexes map[string]int) error {
+	body := struct {
+		Indexes map[string]int `json:"indexes"`
+		Type    int            `json:"type"`
+	}{
+		Indexes: indexes,
+		Type:    aclType,
+	}
+	_, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/cmd/acls/modifyIndex", body)
+	return err
+}
+
 // --- IP Groups ---
 
-// IPGroupEntry represents a single IP + port combination within an IP group.
+// SplitCIDR parses a CIDR-or-bare-IP string into a bare IP address and integer
+// prefix length. A bare host address (no "/" suffix) yields mask 32.
+// Returns an error if the string is not a valid IP or CIDR.
+//
+// Examples:
+//
+//	"10.10.50.0/24"  → ("10.10.50.0", 24, nil)
+//	"10.10.70.98"    → ("10.10.70.98", 32, nil)
+//	"not-an-ip"      → ("", 0, error)
+func SplitCIDR(cidrOrIP string) (string, int, error) {
+	// Try parsing as CIDR first (e.g. "10.10.50.0/24").
+	ip, ipNet, err := net.ParseCIDR(cidrOrIP)
+	if err == nil {
+		ones, _ := ipNet.Mask.Size()
+		// ParseCIDR masks the host bits; use the original parsed IP (host addr).
+		return ip.String(), ones, nil
+	}
+	// Fall back to bare IP (no prefix → mask 32).
+	parsed := net.ParseIP(cidrOrIP)
+	if parsed == nil {
+		return "", 0, fmt.Errorf("invalid IP or CIDR: %q", cidrOrIP)
+	}
+	return parsed.String(), 32, nil
+}
+
+// IPGroupEntry represents a single IP entry within an IP group using the v6
+// wire shape: bare IP address + integer mask (not a CIDR string) + description.
 type IPGroupEntry struct {
-	IP       string   `json:"ip"`
-	PortList []string `json:"portList,omitempty"` // port numbers/ranges as strings (e.g., "80", "7000-7100")
+	IP          string   `json:"ip"`
+	Mask        int      `json:"mask"`
+	Description string   `json:"description"`
+	PortList    []string `json:"portList,omitempty"` // port numbers/ranges (e.g. "80", "7000-7100")
+}
+
+// ipGroupWire is the v6 wire body for create/update. It includes all envelope
+// fields that the ER707 controller requires even when null.
+type ipGroupWire struct {
+	Name           string         `json:"name"`
+	Type           int            `json:"type"`
+	IPList         []IPGroupEntry `json:"ipList"`
+	IPv6List       interface{}    `json:"ipv6List"`
+	MACAddressList interface{}    `json:"macAddressList"`
+	PortList       interface{}    `json:"portList"`
+	CountryList    interface{}    `json:"countryList"`
+	Description    string         `json:"description"`
+	PortType       interface{}    `json:"portType"`
+	PortMaskList   interface{}    `json:"portMaskList"`
+	DomainNamePort interface{}    `json:"domainNamePort"`
+	OUIList        interface{}    `json:"ouiList"`
+	Count          int            `json:"count"`
 }
 
 // IPGroup represents an IP/Port group used in ACL rules.
+// The v6/ER707 controller uses "groupId" (not "id") as the field name in GET
+// responses for /setting/profiles/groups.
 type IPGroup struct {
-	ID     string         `json:"id,omitempty"`
+	ID     string         `json:"groupId,omitempty"`
 	Name   string         `json:"name"`
-	Type   int            `json:"type"` // 1=IP/Port group
+	Type   int            `json:"type"` // 0=IP-only, 1=IP/Port group
 	IPList []IPGroupEntry `json:"ipList"`
+}
+
+// toWire converts an IPGroup to the v6 wire shape with null envelope fields.
+func (g *IPGroup) toWire() *ipGroupWire {
+	return &ipGroupWire{
+		Name:           g.Name,
+		Type:           g.Type,
+		IPList:         g.IPList,
+		IPv6List:       nil,
+		MACAddressList: nil,
+		PortList:       nil,
+		CountryList:    nil,
+		Description:    "",
+		PortType:       nil,
+		PortMaskList:   nil,
+		DomainNamePort: nil,
+		OUIList:        nil,
+		Count:          0,
+	}
 }
 
 // ListIPGroups returns all IP groups for a site.
 // Note: requires a gateway device adopted into the site.
+// Endpoint: GET /setting/profiles/groups (v6/ER707 path).
 func (c *Client) ListIPGroups(ctx context.Context, siteID string) ([]IPGroup, error) {
-	resp, err := c.doSiteRequestWithParams(ctx, siteID, http.MethodGet, "/setting/firewall/ipGroups", "&currentPage=1&currentPageSize=100", nil)
+	resp, err := c.doSiteRequestWithParams(ctx, siteID, http.MethodGet, "/setting/profiles/groups", "&currentPage=1&currentPageSize=100", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1716,7 +3023,9 @@ func (c *Client) ListIPGroups(ctx context.Context, siteID string) ([]IPGroup, er
 	return groups, nil
 }
 
-// GetIPGroup returns a single IP group by ID.
+// GetIPGroup returns a single IP group by ID. Returns an error wrapping
+// ErrNotFound when the group is absent from the controller, allowing callers
+// to detect drift via errors.Is(err, ErrNotFound).
 func (c *Client) GetIPGroup(ctx context.Context, siteID, groupID string) (*IPGroup, error) {
 	groups, err := c.ListIPGroups(ctx, siteID)
 	if err != nil {
@@ -1727,26 +3036,38 @@ func (c *Client) GetIPGroup(ctx context.Context, siteID, groupID string) (*IPGro
 			return &g, nil
 		}
 	}
-	return nil, fmt.Errorf("IP group %q not found", groupID)
+	return nil, fmt.Errorf("IP group %q: %w", groupID, ErrNotFound)
 }
 
 // CreateIPGroup creates a new IP group.
+// Endpoint: POST /setting/profiles/groups (v6/ER707 path).
+// The request body uses the v6 wire shape with explicit null envelope fields.
+// The v6/ER707 controller returns the new group ID as a bare string (not an
+// object), so we unmarshal as string first and re-fetch via GetIPGroup —
+// mirroring the CreateMDNSRule/CreateNetwork pattern.
 func (c *Client) CreateIPGroup(ctx context.Context, siteID string, group *IPGroup) (*IPGroup, error) {
-	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/firewall/ipGroups", group)
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPost, "/setting/profiles/groups", group.toWire())
 	if err != nil {
 		return nil, err
 	}
 
-	var created IPGroup
-	if err := json.Unmarshal(resp.Result, &created); err != nil {
-		return nil, fmt.Errorf("decoding created IP group: %w", err)
+	// The API returns the new group ID as a quoted string, not a full object.
+	var groupID string
+	if err := json.Unmarshal(resp.Result, &groupID); err != nil {
+		return nil, fmt.Errorf("decoding created IP group ID: %w", err)
 	}
-	return &created, nil
+
+	// Fetch the full group by listing + filtering.
+	return c.GetIPGroup(ctx, siteID, groupID)
 }
 
-// UpdateIPGroup updates an existing IP group.
+// UpdateIPGroup updates an existing IP group via PUT.
+// Endpoint: PUT /setting/profiles/groups/{id} (v6/ER707 path).
+// The v6/ER707 controller returns -1600 ("Unsupported request path") for PATCH
+// on profiles/groups endpoints; PUT is the correct verb per the UI-observed API
+// contract (same fix applied to UpdateACLRule on this branch).
 func (c *Client) UpdateIPGroup(ctx context.Context, siteID, groupID string, group *IPGroup) (*IPGroup, error) {
-	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPatch, fmt.Sprintf("/setting/firewall/ipGroups/%s", groupID), group)
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodPut, fmt.Sprintf("/setting/profiles/groups/%s", groupID), group.toWire())
 	if err != nil {
 		return nil, err
 	}
@@ -1761,8 +3082,13 @@ func (c *Client) UpdateIPGroup(ctx context.Context, siteID, groupID string, grou
 }
 
 // DeleteIPGroup deletes an IP group.
-func (c *Client) DeleteIPGroup(ctx context.Context, siteID, groupID string) error {
-	_, err := c.doSiteRequest(ctx, siteID, http.MethodDelete, fmt.Sprintf("/setting/firewall/ipGroups/%s", groupID), nil)
+// Endpoint: DELETE /setting/profiles/groups/{groupType}/{id} (v6/ER707 path).
+// The {groupType} segment is required by the controller; omitting it returns
+// -1600 "Unsupported request path". This provider only manages type-0
+// (IP-only) groups, but the parameter is explicit so callers can pass the
+// value read from state rather than hardcoding a constant.
+func (c *Client) DeleteIPGroup(ctx context.Context, siteID string, groupType int, groupID string) error {
+	_, err := c.doSiteRequest(ctx, siteID, http.MethodDelete, fmt.Sprintf("/setting/profiles/groups/%d/%s", groupType, groupID), nil)
 	return err
 }
 
@@ -1894,8 +3220,7 @@ type SAMLIdPCreateRequest struct {
 
 // ListSAMLIdPs returns all SAML identity provider connections.
 func (c *Client) ListSAMLIdPs(ctx context.Context) ([]SAMLIdP, error) {
-	url := c.globalURL("/idps") + "&currentPage=1&currentPageSize=100"
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	resp, err := c.doGlobalRequest(ctx, http.MethodGet, "/idps", "&currentPage=1&currentPageSize=100", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1926,8 +3251,7 @@ func (c *Client) GetSAMLIdP(ctx context.Context, idpID string) (*SAMLIdP, error)
 // Returns the created IdP (fetched via list+filter since POST returns minimal data).
 func (c *Client) CreateSAMLIdP(ctx context.Context, req *SAMLIdPCreateRequest) (*SAMLIdP, error) {
 	req.ConfMethod = 2
-	url := c.globalURL("/idps")
-	_, err := c.doRequest(ctx, http.MethodPost, url, req)
+	_, err := c.doGlobalRequest(ctx, http.MethodPost, "/idps", "", req)
 	if err != nil {
 		return nil, err
 	}
@@ -1948,8 +3272,7 @@ func (c *Client) CreateSAMLIdP(ctx context.Context, req *SAMLIdPCreateRequest) (
 // UpdateSAMLIdP updates an existing SAML IdP via PUT (full replace).
 func (c *Client) UpdateSAMLIdP(ctx context.Context, idpID string, req *SAMLIdPCreateRequest) (*SAMLIdP, error) {
 	req.ConfMethod = 2
-	url := c.globalURL(fmt.Sprintf("/idps/%s", idpID))
-	_, err := c.doRequest(ctx, http.MethodPut, url, req)
+	_, err := c.doGlobalRequest(ctx, http.MethodPut, fmt.Sprintf("/idps/%s", idpID), "", req)
 	if err != nil {
 		return nil, err
 	}
@@ -1960,8 +3283,7 @@ func (c *Client) UpdateSAMLIdP(ctx context.Context, idpID string, req *SAMLIdPCr
 
 // DeleteSAMLIdP deletes a SAML identity provider connection.
 func (c *Client) DeleteSAMLIdP(ctx context.Context, idpID string) error {
-	url := c.globalURL(fmt.Sprintf("/idps/%s", idpID))
-	_, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	_, err := c.doGlobalRequest(ctx, http.MethodDelete, fmt.Sprintf("/idps/%s", idpID), "", nil)
 	return err
 }
 
@@ -2016,8 +3338,7 @@ type SAMLRoleCreateRequest struct {
 
 // ListSAMLRoles returns all SAML external user groups.
 func (c *Client) ListSAMLRoles(ctx context.Context) ([]SAMLRole, error) {
-	url := c.globalURL("/extendUserGroups") + "&currentPage=1&currentPageSize=100"
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	resp, err := c.doGlobalRequest(ctx, http.MethodGet, "/extendUserGroups", "&currentPage=1&currentPageSize=100", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2046,8 +3367,7 @@ func (c *Client) GetSAMLRole(ctx context.Context, roleID string) (*SAMLRole, err
 
 // CreateSAMLRole creates a new SAML external user group.
 func (c *Client) CreateSAMLRole(ctx context.Context, req *SAMLRoleCreateRequest) (*SAMLRole, error) {
-	url := c.globalURL("/extendUserGroups")
-	resp, err := c.doRequest(ctx, http.MethodPost, url, req)
+	resp, err := c.doGlobalRequest(ctx, http.MethodPost, "/extendUserGroups", "", req)
 	if err != nil {
 		return nil, err
 	}
@@ -2073,8 +3393,7 @@ func (c *Client) CreateSAMLRole(ctx context.Context, req *SAMLRoleCreateRequest)
 
 // UpdateSAMLRole updates an existing SAML role via PUT (full replace).
 func (c *Client) UpdateSAMLRole(ctx context.Context, roleID string, req *SAMLRoleCreateRequest) (*SAMLRole, error) {
-	url := c.globalURL(fmt.Sprintf("/extendUserGroups/%s", roleID))
-	_, err := c.doRequest(ctx, http.MethodPut, url, req)
+	_, err := c.doGlobalRequest(ctx, http.MethodPut, fmt.Sprintf("/extendUserGroups/%s", roleID), "", req)
 	if err != nil {
 		return nil, err
 	}
@@ -2084,8 +3403,7 @@ func (c *Client) UpdateSAMLRole(ctx context.Context, roleID string, req *SAMLRol
 
 // DeleteSAMLRole deletes a SAML external user group.
 func (c *Client) DeleteSAMLRole(ctx context.Context, roleID string) error {
-	url := c.globalURL(fmt.Sprintf("/extendUserGroups/%s", roleID))
-	_, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	_, err := c.doGlobalRequest(ctx, http.MethodDelete, fmt.Sprintf("/extendUserGroups/%s", roleID), "", nil)
 	return err
 }
 
@@ -2116,9 +3434,6 @@ func (c *Client) UploadCertificate(ctx context.Context, certPEM []byte, fileName
 	if c.readOnly {
 		return "", ErrReadOnly
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if err := c.ensureAuth(ctx); err != nil {
 		return "", err
@@ -2190,9 +3505,6 @@ func (c *Client) UploadKey(ctx context.Context, keyPEM []byte, fileName string) 
 	if c.readOnly {
 		return "", ErrReadOnly
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if err := c.ensureAuth(ctx); err != nil {
 		return "", err
@@ -2276,21 +3588,12 @@ func (c *Client) ActivateCertificate(ctx context.Context, certID, keyID string) 
 		return ErrReadOnly
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := c.ensureAuth(ctx); err != nil {
-		return err
-	}
-
-	url := fmt.Sprintf("%s/%s/api/v2/controller/setting", c.baseURL, c.omadacID)
-
 	updateReq := ControllerSettingUpdate{
 		CertID: certID,
 		KeyID:  keyID,
 	}
 
-	_, err := c.doRequest(ctx, http.MethodPatch, url, updateReq)
+	_, err := c.doGlobalRequest(ctx, http.MethodPatch, "/controller/setting", "", updateReq)
 	return err
 }
 
@@ -2304,15 +3607,7 @@ type ControllerSetting struct {
 
 // GetControllerCertificateSetting retrieves the currently active certificate and key IDs.
 func (c *Client) GetControllerCertificateSetting(ctx context.Context) (*ControllerSetting, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := c.ensureAuth(ctx); err != nil {
-		return nil, err
-	}
-
-	url := fmt.Sprintf("%s/%s/api/v2/controller/setting", c.baseURL, c.omadacID)
-	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	resp, err := c.doGlobalRequest(ctx, http.MethodGet, "/controller/setting", "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2323,4 +3618,55 @@ func (c *Client) GetControllerCertificateSetting(ctx context.Context) (*Controll
 	}
 
 	return &setting, nil
+}
+
+// ============================================================================
+// Gateway Ports
+// ============================================================================
+//
+// Gateway port info is exposed via /setting/wan/networks. Each port has a
+// stable UUID that can be passed to omada_network's interfaceIds field to
+// bind a network to that physical/logical port.
+
+// GatewayPort represents a single gateway WAN/LAN port.
+type GatewayPort struct {
+	PortUUID        string   `json:"portUuid"`
+	PortName        string   `json:"portName"`
+	Type            int      `json:"type"`
+	Mode            int      `json:"mode"`
+	LanNetworkNames []string `json:"lanNetworkNames"`
+	SupportVPN      bool     `json:"supportVpn,omitempty"`
+	SupportIPTV     bool     `json:"supportIptv,omitempty"`
+	Closable        bool     `json:"closable,omitempty"`
+	Status          int      `json:"status,omitempty"`
+}
+
+// gatewayPortsResult mirrors the shape of /setting/wan/networks response.
+type gatewayPortsResult struct {
+	OmadacID    string `json:"omadacId"`
+	SiteID      string `json:"siteId"`
+	Enable      bool   `json:"enable"`
+	OsgPortInfo struct {
+		PreOsgModel        int           `json:"preOsgModel"`
+		WanLanPortSettings []GatewayPort `json:"wanLanPortSettings"`
+	} `json:"osgPortInfo"`
+}
+
+// ListGatewayPorts returns the list of WAN/LAN ports configurable on the
+// site's gateway. Works whether or not a gateway is currently adopted —
+// returns the controller's port template either way.
+func (c *Client) ListGatewayPorts(ctx context.Context, siteID string) ([]GatewayPort, error) {
+	resp, err := c.doSiteRequest(ctx, siteID, http.MethodGet, "/setting/wan/networks", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result gatewayPortsResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("decoding gateway ports: %w", err)
+	}
+	if result.OsgPortInfo.WanLanPortSettings == nil {
+		return []GatewayPort{}, nil
+	}
+	return result.OsgPortInfo.WanLanPortSettings, nil
 }
