@@ -410,7 +410,7 @@ resource "omada_dhcp_reservation" "test" {
   network_id = %[2]q
   mac = "00-11-22-33-44-55"
   ip = "192.168.10.10"
-  status = true
+  enabled = true
 }
 
 `, siteID, defaultNetworkID),

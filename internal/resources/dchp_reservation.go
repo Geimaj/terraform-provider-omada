@@ -32,8 +32,7 @@ type DhcpReservationResourceModel struct {
 	IPStart     types.Int64  `tfsdk:"ip_start"`
 	IPEnd       types.Int64  `tfsdk:"ip_end"`
 	Description types.String `tfsdk:"description"`
-	// todo: rename
-	Status types.Bool `tfsdk:"status"`
+	Enabled     types.Bool   `tfsdk:"enabled"`
 	// todo: what are these for?
 	ExportToIPMacBinding types.Bool `tfsdk:"export_to_ip_mac_binding"`
 	Options              types.List `tfsdk:"options"`
@@ -92,8 +91,8 @@ func (r *DhcpReservationResource) Schema(_ context.Context, _ resource.SchemaReq
 				Optional:    true,
 			},
 			// todo: rename
-			"status": schema.BoolAttribute{
-				Description: "The status of the DHCP reservation.",
+			"enabled": schema.BoolAttribute{
+				Description: "Whether the DHCP reservation is enabled.",
 				Required:    true,
 			},
 			"export_to_ip_mac_binding": schema.BoolAttribute{
@@ -166,7 +165,7 @@ func (r *DhcpReservationResource) Create(ctx context.Context, req resource.Creat
 		IPStart:     plan.IPStart.ValueInt64(),
 		IPEnd:       plan.IPEnd.ValueInt64(),
 		Description: plan.Description.ValueString(),
-		Status:      plan.Status.ValueBool(),
+		Status:      plan.Enabled.ValueBool(),
 	}
 
 	_, err := r.client.CreateDHCPReservation(ctx, siteID, createReq)
@@ -190,7 +189,7 @@ func (r *DhcpReservationResource) Create(ctx context.Context, req resource.Creat
 	plan.IPStart = types.Int64Value(reservation.IPStart)
 	plan.IPEnd = types.Int64Value(reservation.IPEnd)
 	plan.Description = types.StringValue(reservation.Description)
-	plan.Status = types.BoolValue(reservation.Status)
+	plan.Enabled = types.BoolValue(reservation.Status)
 	plan.NetworkName = types.StringValue(reservation.NetworkName)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -218,7 +217,7 @@ func (r *DhcpReservationResource) Read(ctx context.Context, req resource.ReadReq
 	state.IPStart = types.Int64Value(reservation.IPStart)
 	state.IPEnd = types.Int64Value(reservation.IPEnd)
 	state.Description = types.StringValue(reservation.Description)
-	state.Status = types.BoolValue(reservation.Status)
+	state.Enabled = types.BoolValue(reservation.Status)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
@@ -245,7 +244,7 @@ func (r *DhcpReservationResource) Update(ctx context.Context, req resource.Updat
 		IPStart:     plan.IPStart.ValueInt64(),
 		IPEnd:       plan.IPEnd.ValueInt64(),
 		Description: plan.Description.ValueString(),
-		Status:      plan.Status.ValueBool(),
+		Status:      plan.Enabled.ValueBool(),
 	}
 
 	success, err := r.client.UpdateDHCPReservation(ctx, siteID, updateReq)
@@ -273,7 +272,7 @@ func (r *DhcpReservationResource) Update(ctx context.Context, req resource.Updat
 	plan.IPStart = types.Int64Value(reservation.IPStart)
 	plan.IPEnd = types.Int64Value(reservation.IPEnd)
 	plan.Description = types.StringValue(reservation.Description)
-	plan.Status = types.BoolValue(reservation.Status)
+	plan.Enabled = types.BoolValue(reservation.Status)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -317,7 +316,7 @@ func (r *DhcpReservationResource) ImportState(ctx context.Context, req resource.
 		IPStart:     types.Int64Value(reservation.IPStart),
 		IPEnd:       types.Int64Value(reservation.IPEnd),
 		Description: types.StringValue(reservation.Description),
-		Status:      types.BoolValue(reservation.Status),
+		Enabled:     types.BoolValue(reservation.Status),
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
