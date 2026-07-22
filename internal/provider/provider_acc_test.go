@@ -37,6 +37,12 @@ func testSiteID(t *testing.T) string {
 	return id
 }
 
+func defaultNetworkId(t *testing.T) string {
+	t.Helper()
+	// todo: fetch this from the controller for the default network
+	return "6a60af1f77c65135be29f7f7"
+}
+
 // =============================================================================
 // Data Source: omada_sites
 // =============================================================================
@@ -377,6 +383,46 @@ data "omada_gateway_ports" "test" {
 					resource.TestCheckResourceAttrSet("data.omada_gateway_ports.test", "ports.#"),
 				),
 			},
+		},
+	})
+}
+
+// =============================================================================
+// Resource: dhcp_reservation (CRUD lifecycle)
+// =============================================================================
+func TestAccResourceDhcpReservation_CRUD(t *testing.T) {
+	siteID := testSiteID(t) // helper — fails the test if OMADA_TEST_SITE_ID unset
+
+	defaultNetworkID := defaultNetworkId(t) // helper — returns a hardcoded default network ID
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+
+
+
+resource "omada_dhcp_reservation" "test" {
+  site_id           = %[1]q
+  description              = "TF_ACC_TEST_DCHP_RESERVATION"
+  network_id = %[2]q
+  mac = "00-11-22-33-44-55"
+  ip = "192.168.10.10"
+  status = true
+}
+
+`, siteID, defaultNetworkID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("omada_dhcp_reservation.test", "id"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "description", "TF_ACC_TEST_DCHP_RESERVATION"),
+					// todo: I need to check the network_id, but I can't figure out how to get the ID of the network resource. The ID is not exposed in the state. Maybe I can use a data source to look it up by name? Or maybe I can just check that the network_id is not empty.
+					// resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "network_id", omada_network.test_dchp_reservation.id),
+				),
+			},
+			// Optional: update step
+			// Optional: import step (ImportState/ImportStateVerify)
 		},
 	})
 }
