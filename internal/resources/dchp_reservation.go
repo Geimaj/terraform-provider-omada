@@ -218,6 +218,7 @@ func (r *DhcpReservationResource) Read(ctx context.Context, req resource.ReadReq
 	state.IPEnd = types.Int64Value(reservation.IPEnd)
 	state.Description = types.StringValue(reservation.Description)
 	state.Enabled = types.BoolValue(reservation.Status)
+	state.NetworkName = types.StringValue(reservation.NetworkName)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
@@ -273,7 +274,7 @@ func (r *DhcpReservationResource) Update(ctx context.Context, req resource.Updat
 	plan.IPEnd = types.Int64Value(reservation.IPEnd)
 	plan.Description = types.StringValue(reservation.Description)
 	plan.Enabled = types.BoolValue(reservation.Status)
-
+	plan.NetworkName = types.StringValue(reservation.NetworkName)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -317,6 +318,7 @@ func (r *DhcpReservationResource) ImportState(ctx context.Context, req resource.
 		IPEnd:       types.Int64Value(reservation.IPEnd),
 		Description: types.StringValue(reservation.Description),
 		Enabled:     types.BoolValue(reservation.Status),
+		NetworkName: types.StringValue(reservation.NetworkName),
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)

@@ -417,11 +417,37 @@ resource "omada_dhcp_reservation" "test" {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("omada_dhcp_reservation.test", "id"),
 					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "description", "TF_ACC_TEST_DCHP_RESERVATION"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "enabled", "true"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "network_id", defaultNetworkID),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "mac", "00-11-22-33-44-55"),
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "ip", "192.168.10.10"),
 					// todo: I need to check the network_id, but I can't figure out how to get the ID of the network resource. The ID is not exposed in the state. Maybe I can use a data source to look it up by name? Or maybe I can just check that the network_id is not empty.
 					// resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "network_id", omada_network.test_dchp_reservation.id),
 				),
 			},
 			// Optional: update step
+			{
+				Config: fmt.Sprintf(`
+
+
+
+resource "omada_dhcp_reservation" "test" {
+  site_id           = %[1]q
+  description              = "TF_ACC_TEST_DCHP_RESERVATION"
+  network_id = %[2]q
+  mac = "00-11-22-33-44-55"
+  ip = "192.168.10.10"
+  enabled = false
+}
+
+`, siteID, defaultNetworkID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "enabled", "false"),
+
+					// todo: I need to check the network_id, but I can't figure out how to get the ID of the network resource. The ID is not exposed in the state. Maybe I can use a data source to look it up by name? Or maybe I can just check that the network_id is not empty.
+					// resource.TestCheckResourceAttr("omada_dhcp_reservation.test", "network_id", omada_network.test_dchp_reservation.id),
+				),
+			},
 			// Optional: import step (ImportState/ImportStateVerify)
 		},
 	})
