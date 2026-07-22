@@ -19,6 +19,8 @@ import (
 var _ resource.Resource = &NetworkResource{}
 var _ resource.ResourceWithImportState = &NetworkResource{}
 
+const defaultForceProvision = true
+
 // NetworkResource manages an Omada LAN network / VLAN.
 type NetworkResource struct {
 	client *client.Client
@@ -247,7 +249,7 @@ func (r *NetworkResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"force_provision": schema.BoolAttribute{
 				Optional:    true,
 				Computed:    true,
-				Default:     booldefault.StaticBool(true),
+				Default:     booldefault.StaticBool(defaultForceProvision),
 				Description: "When the network is created with purpose=interface, ask the controller to push the new config to the gateway device immediately after creation. Without this, the controller stores the network in its DB but the gateway does not pick it up until manually force-provisioned via the OC200 UI. Defaults to true. Has no effect for purpose=vlan networks.",
 				PlanModifiers: []planmodifier.Bool{
 					boolplanmodifier.UseStateForUnknown(),
@@ -365,6 +367,14 @@ func buildNetworkFromModel(ctx context.Context, m *NetworkResourceModel, diags *
 // model. Shared between Read, Create-after-API-roundtrip, Update, ImportState.
 // Honors purpose=vlan semantics: gateway/dhcp fields stay null in that mode.
 func applyNetworkToModel(ctx context.Context, m *NetworkResourceModel, n *client.Network) error {
+	// force_provision is a provider-side action preference, not a network
+	// property returned by Omada. Preserve a configured/state value when one
+	// exists, and initialize fresh models (notably ImportState) to the schema
+	// default so imported state is consistent with normally-created state.
+	if m.ForceProvision.IsNull() || m.ForceProvision.IsUnknown() {
+		m.ForceProvision = types.BoolValue(defaultForceProvision)
+	}
+
 	m.Name = types.StringValue(n.Name)
 	m.Purpose = types.StringValue(n.Purpose)
 	m.VlanID = types.Int64Value(int64(n.Vlan))

@@ -146,6 +146,35 @@ func TestNetwork_ApplyToModel_VlanPurposeNullsDhcp(t *testing.T) {
 	}
 }
 
+// TestNetwork_ApplyToModel_ForceProvision verifies that API reads preserve an
+// explicitly configured action preference while fresh import models receive
+// the same default declared by the resource schema. Omada does not persist or
+// return this provider-side setting.
+func TestNetwork_ApplyToModel_ForceProvision(t *testing.T) {
+	ctx := context.Background()
+	n := &client.Network{ID: "net-1", Name: "iot", Purpose: "vlan", Vlan: 50}
+
+	t.Run("fresh import model receives default", func(t *testing.T) {
+		state := &NetworkResourceModel{}
+		if err := applyNetworkToModel(ctx, state, n); err != nil {
+			t.Fatalf("applyNetworkToModel: %v", err)
+		}
+		if state.ForceProvision.IsNull() || !state.ForceProvision.ValueBool() {
+			t.Errorf("ForceProvision = %v, want true", state.ForceProvision)
+		}
+	})
+
+	t.Run("configured false is preserved", func(t *testing.T) {
+		state := &NetworkResourceModel{ForceProvision: types.BoolValue(false)}
+		if err := applyNetworkToModel(ctx, state, n); err != nil {
+			t.Fatalf("applyNetworkToModel: %v", err)
+		}
+		if state.ForceProvision.IsNull() || state.ForceProvision.ValueBool() {
+			t.Errorf("ForceProvision = %v, want false", state.ForceProvision)
+		}
+	})
+}
+
 // TestNetwork_ApplyToModel_InterfacePurposeAllFields verifies the full
 // purpose=interface read path covers every newly-surfaced field.
 func TestNetwork_ApplyToModel_InterfacePurposeAllFields(t *testing.T) {
