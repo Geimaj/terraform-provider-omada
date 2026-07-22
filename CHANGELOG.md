@@ -2,6 +2,64 @@
 
 > **Fork point.** This changelog continues from `emanuelbesliu/terraform-provider-tplink-omada` v2.1.1. The Daily-Nerd fork resets versioning to `0.x.y` to signal a different lineage. Upstream history is preserved below for reference.
 
+## [0.1.0](https://github.com/Geimaj/terraform-provider-omada/compare/v0.2.0...v0.1.0) (2026-07-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **device_switch:** `omada_device_switch.ports[]` is now read-only. Manage individual ports with the `omada_switch_port` resource instead. Configs that previously set port fields under `device_switch.ports[]` must move those to `omada_switch_port` resources.
+* **switch_port:** untag_network_ids is now Computed-only; the controller derives it from the native VLAN. Remove it from existing configurations.
+
+### Features
+
+* acceptance test infrastructure (closes [#7](https://github.com/Geimaj/terraform-provider-omada/issues/7)) ([b807129](https://github.com/Geimaj/terraform-provider-omada/commit/b807129f86644084e591d7eec8ecf8e7480b1dfa))
+* acceptance test infrastructure (closes [#7](https://github.com/Geimaj/terraform-provider-omada/issues/7)) ([d03db34](https://github.com/Geimaj/terraform-provider-omada/commit/d03db3429956d30eb4c8b6d2a71165f32c5d27eb))
+* add lan_interface_ids field to omada_network (closes [#5](https://github.com/Geimaj/terraform-provider-omada/issues/5)) ([3f7bbb0](https://github.com/Geimaj/terraform-provider-omada/commit/3f7bbb0e29fc867901e8340fa85f68825d9bb54d))
+* add lan_interface_ids field to omada_network (closes [#5](https://github.com/Geimaj/terraform-provider-omada/issues/5)) ([275b4f0](https://github.com/Geimaj/terraform-provider-omada/commit/275b4f087d34e482f2949819b1bd93b1cf7ef0ab))
+* add omada_gateway_ports data source (closes [#6](https://github.com/Geimaj/terraform-provider-omada/issues/6)) ([949e7a2](https://github.com/Geimaj/terraform-provider-omada/commit/949e7a28d6cc5a4c34dc336e5e8f7effc6db4d0b))
+* add omada_gateway_ports data source (closes [#6](https://github.com/Geimaj/terraform-provider-omada/issues/6)) ([90c4067](https://github.com/Geimaj/terraform-provider-omada/commit/90c406754f69a45d2a21c73d437baceabcafe788))
+* **client:** lazy provider authentication ([ed5815f](https://github.com/Geimaj/terraform-provider-omada/commit/ed5815fcdd59b34e9e19abed774ecf23cf0759b5)), closes [#24](https://github.com/Geimaj/terraform-provider-omada/issues/24)
+* **client:** lazy provider authentication (closes [#24](https://github.com/Geimaj/terraform-provider-omada/issues/24)) ([75b71a8](https://github.com/Geimaj/terraform-provider-omada/commit/75b71a881105eed7db54fd9a533d5b12aab0712d))
+* **device_switch:** make ports read-only, remove dual-write path ([#63](https://github.com/Geimaj/terraform-provider-omada/issues/63)) ([dd97128](https://github.com/Geimaj/terraform-provider-omada/commit/dd971280076d37427f9f14880d15e52253085bdd))
+* **firewall_acl:** PUT update + omada_firewall_acl_order for declarative ordering ([#57](https://github.com/Geimaj/terraform-provider-omada/issues/57)) ([c883481](https://github.com/Geimaj/terraform-provider-omada/commit/c8834812502ba3eb176c1dcfa93e08d4074899f0))
+* initial fork from emanuelbesliu/terraform-provider-tplink-omada v2.1.1 ([5a31cc7](https://github.com/Geimaj/terraform-provider-omada/commit/5a31cc7f9abd4f33939689765d93d7f17bc56d42))
+* **network:** create purpose=interface networks via v6 openapi/v1 endpoint ([03d18fa](https://github.com/Geimaj/terraform-provider-omada/commit/03d18faaad06cbd18c694b80d070711a8be7e313))
+* **network:** force-provision gateway after openapi/v1 interface create ([#50](https://github.com/Geimaj/terraform-provider-omada/issues/50)) ([e2872eb](https://github.com/Geimaj/terraform-provider-omada/commit/e2872eb68697296414ec5f7491621056a57216c8))
+* **network:** surface 14 controller-exposed fields ([a5a0303](https://github.com/Geimaj/terraform-provider-omada/commit/a5a0303805064ffaf060599a0ed5eb97976f0a62)), closes [#15](https://github.com/Geimaj/terraform-provider-omada/issues/15)
+* **network:** surface 14 missing controller fields (closes [#15](https://github.com/Geimaj/terraform-provider-omada/issues/15)) ([3488872](https://github.com/Geimaj/terraform-provider-omada/commit/3488872f6851e182a4b9de710937951da5a6cdce))
+* **network:** surface dhcpns1/dhcpns2 as dhcp_dns_primary/secondary ([#52](https://github.com/Geimaj/terraform-provider-omada/issues/52)) ([4b913be](https://github.com/Geimaj/terraform-provider-omada/commit/4b913beef45ef9e068fdc602c40bfbc27670071a))
+* **port_profile:** plan-time warnings for Easy-Managed-ignored fields ([8a68a6d](https://github.com/Geimaj/terraform-provider-omada/commit/8a68a6d5e30189d21b1fd4acf48eabdff1b53e88))
+* **port_profile:** plan-time warnings for Easy-Managed-ignored fields (Phase 2 of [#25](https://github.com/Geimaj/terraform-provider-omada/issues/25)) ([26690e6](https://github.com/Geimaj/terraform-provider-omada/commit/26690e6e6208532dd0f79b4de12c0cdd529f3e1b))
+* **port_profile:** surface 24+ controller-exposed fields ([14f0370](https://github.com/Geimaj/terraform-provider-omada/commit/14f03702d8e2ab96e727c2f0cdf7c5c8ae632207)), closes [#22](https://github.com/Geimaj/terraform-provider-omada/issues/22)
+* **port_profile:** surface 24+ missing controller fields (closes [#22](https://github.com/Geimaj/terraform-provider-omada/issues/22)) ([731e098](https://github.com/Geimaj/terraform-provider-omada/commit/731e098815dfca104e70d06d8d217939160594ab))
+* **switch_port:** configure switch port mirroring (operation + mirrored_ports) ([#61](https://github.com/Geimaj/terraform-provider-omada/issues/61)) ([20d43e5](https://github.com/Geimaj/terraform-provider-omada/commit/20d43e5e8fcc385f3f8e3d82aa1fec7543be0bbb))
+* **switch_port:** per-port resource for switch port config (closes [#23](https://github.com/Geimaj/terraform-provider-omada/issues/23)) ([6886371](https://github.com/Geimaj/terraform-provider-omada/commit/68863719da5f450d70e6ec48b8bfd669ff6dfa34))
+* **switch_port:** per-port resource for switch port config (closes [#23](https://github.com/Geimaj/terraform-provider-omada/issues/23)) ([94fbecc](https://github.com/Geimaj/terraform-provider-omada/commit/94fbecca914a1d84763c9c91b6f95de12b2526c4))
+* **switch_port:** route writes through openapi/v1 with per-port VLAN derivation ([#55](https://github.com/Geimaj/terraform-provider-omada/issues/55)) ([4f28238](https://github.com/Geimaj/terraform-provider-omada/commit/4f28238cbce74b676b55bce0da1a3c8beadec20d)), closes [#54](https://github.com/Geimaj/terraform-provider-omada/issues/54)
+
+
+### Bug Fixes
+
+* **client:** serialize openapi/v1 network creates + retry on -1 ([#49](https://github.com/Geimaj/terraform-provider-omada/issues/49)) ([7e027c1](https://github.com/Geimaj/terraform-provider-omada/commit/7e027c1d9d2b530f02f77ef64dde81181f6e2ec7))
+* data sources return empty list instead of null when controller has no items (closes [#16](https://github.com/Geimaj/terraform-provider-omada/issues/16)) ([8ff43a3](https://github.com/Geimaj/terraform-provider-omada/commit/8ff43a31ba964ab72387bf60167ea5838dd8f861))
+* data sources return empty list instead of null when controller has no items (closes [#16](https://github.com/Geimaj/terraform-provider-omada/issues/16)) ([aabd76d](https://github.com/Geimaj/terraform-provider-omada/commit/aabd76dc63db6b1af692575b2189714c7872d43b))
+* gofmt after module path rename ([36866fe](https://github.com/Geimaj/terraform-provider-omada/commit/36866fe2d0b2d610d52994d2218fddef18d71404))
+* **network:** DHCP defaults ([#43](https://github.com/Geimaj/terraform-provider-omada/issues/43)) + purpose RequiresReplace ([#45](https://github.com/Geimaj/terraform-provider-omada/issues/45)) ([372707a](https://github.com/Geimaj/terraform-provider-omada/commit/372707adb2b9768ca93ca021a8e8960fb04ce2ea))
+* **network:** inject DHCP defaults to avoid API -1001 on interface flip ([039fbdd](https://github.com/Geimaj/terraform-provider-omada/commit/039fbddd217eb16ada5df16d55ee8932df4e6ff2))
+* **network:** mark `purpose` as RequiresReplace ([88487b3](https://github.com/Geimaj/terraform-provider-omada/commit/88487b3f5626efbaf1ca23252448f2013a3f2585))
+* **port_profile:** route Update through openapi/v2 to unblock -33854 ([#53](https://github.com/Geimaj/terraform-provider-omada/issues/53)) ([3d6b779](https://github.com/Geimaj/terraform-provider-omada/commit/3d6b77930506ae2443c922557f025d838fc4b0a5))
+* registry namespace must be 'daily-nerd/omada' (hyphen preserved) ([0ab19ab](https://github.com/Geimaj/terraform-provider-omada/commit/0ab19abac562b0cc237817efe221edae3ee48d02))
+* run gofmt after module path rename ([0e9dfe4](https://github.com/Geimaj/terraform-provider-omada/commit/0e9dfe41368163ad34a53bc12d69f18659a06761))
+* **switch_port:** drop static defaults on speed and network_tags_setting ([f49af2e](https://github.com/Geimaj/terraform-provider-omada/commit/f49af2e35c894c012fc9bccd5c6df3c5d7292d28))
+* **switch_port:** drop static defaults on speed and network_tags_setting ([fb0fabe](https://github.com/Geimaj/terraform-provider-omada/commit/fb0fabec1ee7f1c1f5cfcf052d409cc806135d78))
+* **switch_port:** preserve unconfigured fields on write; couple mirroring with override ([#62](https://github.com/Geimaj/terraform-provider-omada/issues/62)) ([bfb24f0](https://github.com/Geimaj/terraform-provider-omada/commit/bfb24f044894503ebe268c287a1acb98e923b5d6))
+* use correct registry namespace 'daily-nerd/omada' (hyphen) ([0dfca97](https://github.com/Geimaj/terraform-provider-omada/commit/0dfca978d196908c8202049c3b1fdfacee2f7e08))
+
+
+### Miscellaneous Chores
+
+* pin first release to 0.1.0 ([0afc589](https://github.com/Geimaj/terraform-provider-omada/commit/0afc5894c066bef23434ccbd48481cd1dd0fe1ff))
+
 ## [Unreleased]
 
 ### BREAKING CHANGES
